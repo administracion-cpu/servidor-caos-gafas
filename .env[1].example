@@ -1,0 +1,5 @@
+MENTRA_API_KEY=pega_aqui_tu_api_key_de_mentra
+MENTRA_PACKAGE_NAME=com.caos.gafas
+MENTRA_BRIDGE_SECRET=pega_aqui_la_contrasena_secreta
+CAOS_BRIDGE_URL=https://xnawzzrfbwumhnbmrswk.supabase.co/functions/v1/mentra-bridge
+PORT=3000
