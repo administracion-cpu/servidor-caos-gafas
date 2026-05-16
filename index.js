@@ -3,12 +3,17 @@
 // Arreglar import appServer
 import * as MentraSDK from "@mentra/sdk";
 
-const AppServer = MentraSDK.AppServer || MentraSDK.default?.AppServer;
+const ServerBase =
+  MentraSDK.AppServer ||
+  MentraSDK.TpaServer ||
+  MentraSDK.default?.AppServer ||
+  MentraSDK.default?.TpaServer;
 
-if (!AppServer) {
-  console.error("No encuentro AppServer en @mentra/sdk:", Object.keys(MentraSDK));
+if (!ServerBase) {
+  console.error("No encuentro servidor Mentra:", Object.keys(MentraSDK));
   process.exit(1);
 }
+
 
 import fetch from "node-fetch";
 
@@ -29,7 +34,7 @@ if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BR
 // El operario dice por voz "emparejar 123456" para vincular las gafas.
 const pairingByUser = new Map();
 
-const server = new AppServer({
+const server = new ServerBase({
   packageName: MENTRA_PACKAGE_NAME,
   apiKey: MENTRA_API_KEY,
   port: Number(PORT),
