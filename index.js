@@ -1,7 +1,8 @@
 // Servidor puente CAO-S <-> Gafas Mentra
 // Recibe fotos desde las gafas Mentra y las reenvía al diario de obra del usuario en CAO-S.
 
-import { AppServer } from "@mentra/sdk";
+import pkg from "@mentra/sdk";
+const { AppServer } = pkg;
 import fetch from "node-fetch";
 
 const {
