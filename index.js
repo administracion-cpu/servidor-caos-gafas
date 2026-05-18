@@ -1,8 +1,4 @@
 // Servidor puente CAO-S <-> Gafas Mentra
-// - Manda LATIDOS a CAO-S cuando las gafas se encienden y cada 30s.
-// - Manda FOTOS cuando dices "foto" o pulsas el botón.
-// - Usa device_id estable (el userId de Mentra) para que CAO-S sepa quién es.
-
 import * as MentraSDK from "@mentra/sdk";
 import fetch from "node-fetch";
 
@@ -26,9 +22,28 @@ const {
 } = process.env;
 
 if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BRIDGE_URL) {
-  console.error("[CAO-S] Faltan variables de entorno: MENTRA_API_KEY, MENTRA_PACKAGE_NAME, MENTRA_BRIDGE_SECRET, CAOS_BRIDGE_URL");
+  console.error("[CAO-S] Faltan variables de entorno");
   process.exit(1);
 }
+
+// 🛡️ Tragarse errores que vienen del SDK por mensajes desconocidos de las gafas
+// (p.ej. "device_state_update"). Si no, la sesión se cae.
+process.on("uncaughtException", (err) => {
+  const msg = String(err?.message || err);
+  if (msg.includes("Unrecognized message type")) {
+    console.warn("[CAO-S] Mensaje desconocido del SDK ignorado:", msg);
+    return;
+  }
+  console.error("[CAO-S] uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  const msg = String(reason?.message || reason);
+  if (msg.includes("Unrecognized message type")) {
+    console.warn("[CAO-S] Mensaje desconocido del SDK ignorado:", msg);
+    return;
+  }
+  console.error("[CAO-S] unhandledRejection:", reason);
+});
 
 const HEARTBEAT_MS = 30_000;
 
@@ -38,7 +53,6 @@ const server = new ServerBase({
   port: Number(PORT),
 });
 
-// Llamada genérica al puente de CAO-S
 async function sendToCaos(payload) {
   try {
     const res = await fetch(CAOS_BRIDGE_URL, {
@@ -57,61 +71,65 @@ async function sendToCaos(payload) {
     console.log(`[CAO-S] OK ${payload.event_type || "photo"} → ${txt}`);
     return { ok: true, status: res.status, body: txt };
   } catch (e) {
-    console.error("[CAO-S] Error de red llamando al puente:", e?.message || e);
+    console.error("[CAO-S] Error de red:", e?.message || e);
     return { ok: false, error: String(e) };
   }
 }
 
 server.onSession(async (session, sessionId, userId) => {
-  const deviceId = String(userId); // Identificador estable de estas gafas
-  const deviceModel = session.device?.model ?? "Mentra";
-  console.log(`[CAO-S] Sesión abierta. device_id=${deviceId} model=${deviceModel}`);
+  try {
+    const deviceId = String(userId);
+    const deviceModel = session.device?.model ?? "Mentra";
+    console.log(`[CAO-S] Sesión abierta. device_id=${deviceId}`);
 
-  session.layouts.showTextWall("CAO-S conectado. Di 'foto' o pulsa el botón.");
+    try { session.layouts.showTextWall("CAO-S conectado. Di 'foto' o pulsa el botón."); } catch {}
 
-  // 1) Latido inmediato para que CAO-S registre las gafas
-  await sendToCaos({
-    device_id: deviceId,
-    event_type: "heartbeat",
-    device_model: deviceModel,
-    battery_level: session.device?.batteryLevel ?? null,
-  });
-
-  // 2) Latido periódico mientras la sesión esté abierta
-  const heartbeatTimer = setInterval(() => {
-    sendToCaos({
+    await sendToCaos({
       device_id: deviceId,
       event_type: "heartbeat",
-      device_model: session.device?.model ?? deviceModel,
+      device_model: deviceModel,
       battery_level: session.device?.batteryLevel ?? null,
     });
-  }, HEARTBEAT_MS);
 
-  // Cuando se cierre la sesión, parar latidos
-  session.events.onDisconnected?.(() => {
-    console.log(`[CAO-S] Sesión cerrada device_id=${deviceId}`);
-    clearInterval(heartbeatTimer);
-  });
+    const heartbeatTimer = setInterval(() => {
+      sendToCaos({
+        device_id: deviceId,
+        event_type: "heartbeat",
+        device_model: session.device?.model ?? deviceModel,
+        battery_level: session.device?.batteryLevel ?? null,
+      }).catch(() => {});
+    }, HEARTBEAT_MS);
 
-  // 3) Escuchar voz: "foto" / "captura" / "saca foto"
-  session.events.onTranscription(async (data) => {
-    if (!data.isFinal) return;
-    const text = (data.text || "").toLowerCase().trim();
-    if (/\b(foto|captura|capturar|saca\s+foto)\b/.test(text)) {
-      await takePhoto(session, deviceId);
-    }
-  });
+    session.events.onDisconnected?.(() => {
+      console.log(`[CAO-S] Sesión cerrada device_id=${deviceId}`);
+      clearInterval(heartbeatTimer);
+    });
 
-  // 4) Botón físico de las gafas (si el firmware lo emite)
-  session.events.onButtonPress?.(async () => {
-    await takePhoto(session, deviceId);
-  });
+    session.events.onTranscription?.(async (data) => {
+      try {
+        if (!data?.isFinal) return;
+        const text = (data.text || "").toLowerCase().trim();
+        if (/\b(foto|captura|capturar|saca\s+foto)\b/.test(text)) {
+          await takePhoto(session, deviceId);
+        }
+      } catch (e) {
+        console.error("[CAO-S] Error en transcripción:", e?.message || e);
+      }
+    });
+
+    session.events.onButtonPress?.(async () => {
+      try { await takePhoto(session, deviceId); }
+      catch (e) { console.error("[CAO-S] Error botón:", e?.message || e); }
+    });
+  } catch (e) {
+    console.error("[CAO-S] Error montando sesión:", e?.message || e);
+  }
 });
 
 async function takePhoto(session, deviceId) {
   try {
-    session.layouts.showTextWall("Capturando...");
-    const photo = await session.camera.requestPhoto(); // { buffer, mimeType }
+    try { session.layouts.showTextWall("Capturando..."); } catch {}
+    const photo = await session.camera.requestPhoto();
     const b64 = Buffer.from(photo.buffer).toString("base64");
 
     const result = await sendToCaos({
@@ -125,25 +143,22 @@ async function takePhoto(session, deviceId) {
     });
 
     if (!result.ok) {
-      session.layouts.showTextWall(`Error ${result.status || ""}`.trim());
+      try { session.layouts.showTextWall(`Error ${result.status || ""}`.trim()); } catch {}
       return;
     }
-
-    // Mensaje según respuesta de CAO-S
     if (result.body?.includes("glasses_orphan")) {
-      session.layouts.showTextWall("Gafas sin dueño. Reclámalas en CAO-S ('Son mías').");
+      try { session.layouts.showTextWall("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
     } else if (result.body?.includes("no_target_work")) {
-      session.layouts.showTextWall("Sin obra activa. Empieza una en CAO-S.");
+      try { session.layouts.showTextWall("Sin obra activa en CAO-S."); } catch {}
     } else {
-      session.layouts.showTextWall("Foto enviada al diario ✓");
+      try { session.layouts.showTextWall("Foto enviada al diario ✓"); } catch {}
     }
   } catch (e) {
-    console.error("[CAO-S] Excepción capturando foto:", e);
-    session.layouts.showTextWall("Error al capturar");
+    console.error("[CAO-S] Excepción foto:", e?.message || e);
+    try { session.layouts.showTextWall("Error al capturar"); } catch {}
   }
 }
 
 server.start().then(() => {
   console.log(`[CAO-S] Servidor de gafas escuchando en puerto ${PORT}`);
-  console.log(`[CAO-S] Reenviando a: ${CAOS_BRIDGE_URL}`);
 });
