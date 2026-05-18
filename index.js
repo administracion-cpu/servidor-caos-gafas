@@ -28,7 +28,6 @@ if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BR
 
 console.log("[CAO-S] Arrancando. Puente apunta a:", CAOS_BRIDGE_URL);
 
-// Tragar errores raros del SDK por mensajes desconocidos
 process.on("uncaughtException", (err) => {
   const m = String(err?.message || err);
   if (m.includes("Unrecognized message type")) {
@@ -44,10 +43,10 @@ process.on("unhandledRejection", (r) => {
 });
 
 const HEARTBEAT_MS = 30_000;
-const WAKE_MS = 8_000; // ventana de escucha tras "hola caos"
+const WAKE_MS = 8_000;
 
 // ───────────────────────────────────────────────
-// Enviar cualquier evento al puente de CAO-S
+// Enviar evento a CAO-S
 // ───────────────────────────────────────────────
 async function sendToCaos(payload) {
   try {
@@ -64,7 +63,7 @@ async function sendToCaos(payload) {
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
     console.log(
       `[CAO-S] ${res.ok ? "OK" : "FAIL"} ${payload.event_type} →`,
-      JSON.stringify(data)
+      JSON.stringify({ ok: data?.ok, reason: data?.reason, work_id: data?.work_id })
     );
     return { ok: res.ok, status: res.status, body: text, data };
   } catch (e) {
@@ -74,7 +73,52 @@ async function sendToCaos(payload) {
 }
 
 // ───────────────────────────────────────────────
-// Normalizar texto (minúsculas, sin tildes ni signos)
+// Reproducir audio de CAOS IA en las gafas
+// (prueba varios métodos del SDK; si no hay audio,
+// muestra el texto en pantalla como respaldo)
+// ───────────────────────────────────────────────
+async function speakOnGlasses(session, speak) {
+  if (!speak) return;
+  const { text, audio_base64, mime = "audio/mpeg" } = speak;
+
+  if (audio_base64) {
+    try {
+      const buf = Buffer.from(audio_base64, "base64");
+      const dataUrl = `data:${mime};base64,${audio_base64}`;
+
+      // Probar APIs conocidas del SDK Mentra para reproducir audio
+      if (typeof session?.audio?.playBuffer === "function") {
+        await session.audio.playBuffer(buf, { mime });
+        return;
+      }
+      if (typeof session?.audio?.play === "function") {
+        await session.audio.play(buf, { mime });
+        return;
+      }
+      if (typeof session?.audio?.playUrl === "function") {
+        await session.audio.playUrl(dataUrl);
+        return;
+      }
+      if (typeof session?.speaker?.play === "function") {
+        await session.speaker.play(buf, { mime });
+        return;
+      }
+      if (typeof session?.playAudio === "function") {
+        await session.playAudio(buf, { mime });
+        return;
+      }
+      console.warn("[CAO-S] SDK sin API de audio. Claves session:", Object.keys(session || {}));
+    } catch (e) {
+      console.warn("[CAO-S] Audio falló, usando texto:", e?.message || e);
+    }
+  }
+
+  // Fallback: texto en pantalla
+  try { session.layouts?.showTextWall?.(text || "", { duration: 2500 }); } catch {}
+}
+
+// ───────────────────────────────────────────────
+// Normalizar texto
 // ───────────────────────────────────────────────
 function normalizeText(s = "") {
   return s
@@ -86,7 +130,7 @@ function normalizeText(s = "") {
 }
 
 // ───────────────────────────────────────────────
-// Capturar foto (prueba todos los nombres del SDK)
+// Capturar foto
 // ───────────────────────────────────────────────
 async function handlePhoto(session, deviceId) {
   try {
@@ -132,16 +176,17 @@ async function handlePhoto(session, deviceId) {
       captured_at: new Date().toISOString(),
     });
 
-    if (!result.ok) {
-      try { session.layouts?.showTextWall?.(`Error ${result.status || ""}`.trim()); } catch {}
+    // Confirmación por voz CAOS IA (o texto si no hay audio)
+    if (result.data?.speak) {
+      await speakOnGlasses(session, result.data.speak);
       return;
     }
-    if (result.body?.includes("glasses_orphan")) {
-      try { session.layouts?.showTextWall?.("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
-    } else if (result.body?.includes("no_target_work")) {
-      try { session.layouts?.showTextWall?.("Acércate a una obra del día o ficha."); } catch {}
+
+    // Sin "speak" (errores de red): respaldo en pantalla
+    if (!result.ok) {
+      try { session.layouts?.showTextWall?.(`Error ${result.status || ""}`.trim()); } catch {}
     } else {
-      try { session.layouts?.showTextWall?.("Foto enviada al diario ✓"); } catch {}
+      try { session.layouts?.showTextWall?.("Foto enviada ✓"); } catch {}
     }
   } catch (e) {
     console.error("[CAO-S] Excepción foto:", e?.message || e);
@@ -150,7 +195,7 @@ async function handlePhoto(session, deviceId) {
 }
 
 // ───────────────────────────────────────────────
-// Servidor Mentra (subclase con onSession)
+// Servidor Mentra
 // ───────────────────────────────────────────────
 class CaosServer extends ServerBase {
   async onSession(session, sessionId, userId) {
@@ -181,7 +226,6 @@ class CaosServer extends ServerBase {
       clearInterval(timer);
     });
 
-    // Estado de escucha activa por sesión
     let awakeUntil = 0;
 
     session.events.onTranscription?.(async (data) => {
@@ -190,19 +234,16 @@ class CaosServer extends ServerBase {
         const text = normalizeText(data.text || "");
         if (!text) return;
 
-        // Wake-word: "hola caos" → abre ventana de 8 s
         if (text.includes("hola caos")) {
           awakeUntil = Date.now() + WAKE_MS;
           console.log("[CAO-S] Despierto 8s");
           try { session.layouts?.showTextWall?.("Caos te escucha", { duration: 1500 }); } catch {}
         }
 
-        // Comando 'foto' SOLO si está despierto
         if (/\b(foto|captura|capturar|saca\s+foto)\b/.test(text)) {
           if (Date.now() < awakeUntil) {
             console.log("[CAO-S] Foto por voz");
             await handlePhoto(session, deviceId);
-            // Mantenemos la ventana abierta para encadenar más fotos
           } else {
             console.log("[CAO-S] 'foto' ignorada (gafas dormidas)");
           }
@@ -210,7 +251,6 @@ class CaosServer extends ServerBase {
       } catch (e) { console.error("[CAO-S] Voz:", e?.message || e); }
     });
 
-    // El botón físico siempre dispara, sin necesidad de wake-word
     session.events.onButtonPress?.(async () => {
       try { await handlePhoto(session, deviceId); }
       catch (e) { console.error("[CAO-S] Botón:", e?.message || e); }
