@@ -9,7 +9,7 @@ const ServerBase =
   MentraSDK.default?.TpaServer;
 
 if (!ServerBase) {
-  console.error("[CAO-S] No encuentro servidor Mentra en el SDK:", Object.keys(MentraSDK));
+  console.error("[CAO-S] No encuentro servidor Mentra:", Object.keys(MentraSDK));
   process.exit(1);
 }
 
@@ -26,32 +26,24 @@ if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BR
   process.exit(1);
 }
 
-// 🛡️ Tragarse errores que vienen del SDK por mensajes desconocidos de las gafas
-// (p.ej. "device_state_update"). Si no, la sesión se cae.
+console.log("[CAO-S] Arrancando. Puente apunta a:", CAOS_BRIDGE_URL);
+
+// Tragar errores raros del SDK por mensajes desconocidos
 process.on("uncaughtException", (err) => {
-  const msg = String(err?.message || err);
-  if (msg.includes("Unrecognized message type")) {
-    console.warn("[CAO-S] Mensaje desconocido del SDK ignorado:", msg);
+  const m = String(err?.message || err);
+  if (m.includes("Unrecognized message type")) {
+    console.warn("[CAO-S] Mensaje desconocido SDK (ignorado):", m);
     return;
   }
   console.error("[CAO-S] uncaughtException:", err);
 });
-process.on("unhandledRejection", (reason) => {
-  const msg = String(reason?.message || reason);
-  if (msg.includes("Unrecognized message type")) {
-    console.warn("[CAO-S] Mensaje desconocido del SDK ignorado:", msg);
-    return;
-  }
-  console.error("[CAO-S] unhandledRejection:", reason);
+process.on("unhandledRejection", (r) => {
+  const m = String(r?.message || r);
+  if (m.includes("Unrecognized message type")) return;
+  console.error("[CAO-S] unhandledRejection:", r);
 });
 
 const HEARTBEAT_MS = 30_000;
-
-const server = new ServerBase({
-  packageName: MENTRA_PACKAGE_NAME,
-  apiKey: MENTRA_API_KEY,
-  port: Number(PORT),
-});
 
 async function sendToCaos(payload) {
   try {
@@ -71,16 +63,17 @@ async function sendToCaos(payload) {
     console.log(`[CAO-S] OK ${payload.event_type || "photo"} → ${txt}`);
     return { ok: true, status: res.status, body: txt };
   } catch (e) {
-    console.error("[CAO-S] Error de red:", e?.message || e);
+    console.error("[CAO-S] Error red:", e?.message || e);
     return { ok: false, error: String(e) };
   }
 }
 
-server.onSession(async (session, sessionId, userId) => {
-  try {
+// ✅ HAY QUE SUBCLASEAR y sobrescribir onSession, no pasarlo como callback
+class CaosServer extends ServerBase {
+  async onSession(session, sessionId, userId) {
     const deviceId = String(userId);
     const deviceModel = session.device?.model ?? "Mentra";
-    console.log(`[CAO-S] Sesión abierta. device_id=${deviceId}`);
+    console.log(`[CAO-S] Sesión abierta device_id=${deviceId} model=${deviceModel}`);
 
     try { session.layouts.showTextWall("CAO-S conectado. Di 'foto' o pulsa el botón."); } catch {}
 
@@ -91,7 +84,7 @@ server.onSession(async (session, sessionId, userId) => {
       battery_level: session.device?.batteryLevel ?? null,
     });
 
-    const heartbeatTimer = setInterval(() => {
+    const timer = setInterval(() => {
       sendToCaos({
         device_id: deviceId,
         event_type: "heartbeat",
@@ -102,7 +95,7 @@ server.onSession(async (session, sessionId, userId) => {
 
     session.events.onDisconnected?.(() => {
       console.log(`[CAO-S] Sesión cerrada device_id=${deviceId}`);
-      clearInterval(heartbeatTimer);
+      clearInterval(timer);
     });
 
     session.events.onTranscription?.(async (data) => {
@@ -112,19 +105,15 @@ server.onSession(async (session, sessionId, userId) => {
         if (/\b(foto|captura|capturar|saca\s+foto)\b/.test(text)) {
           await takePhoto(session, deviceId);
         }
-      } catch (e) {
-        console.error("[CAO-S] Error en transcripción:", e?.message || e);
-      }
+      } catch (e) { console.error("[CAO-S] Voz:", e?.message || e); }
     });
 
     session.events.onButtonPress?.(async () => {
       try { await takePhoto(session, deviceId); }
-      catch (e) { console.error("[CAO-S] Error botón:", e?.message || e); }
+      catch (e) { console.error("[CAO-S] Botón:", e?.message || e); }
     });
-  } catch (e) {
-    console.error("[CAO-S] Error montando sesión:", e?.message || e);
   }
-});
+}
 
 async function takePhoto(session, deviceId) {
   try {
@@ -159,6 +148,12 @@ async function takePhoto(session, deviceId) {
   }
 }
 
+const server = new CaosServer({
+  packageName: MENTRA_PACKAGE_NAME,
+  apiKey: MENTRA_API_KEY,
+  port: Number(PORT),
+});
+
 server.start().then(() => {
-  console.log(`[CAO-S] Servidor de gafas escuchando en puerto ${PORT}`);
+  console.log(`[CAO-S] Servidor escuchando puerto ${PORT}`);
 });
