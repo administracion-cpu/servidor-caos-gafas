@@ -44,6 +44,7 @@ process.on("unhandledRejection", (r) => {
 });
 
 const HEARTBEAT_MS = 30_000;
+const WAKE_MS = 8_000; // ventana de escucha tras "hola caos"
 
 // ───────────────────────────────────────────────
 // Enviar cualquier evento al puente de CAO-S
@@ -73,18 +74,23 @@ async function sendToCaos(payload) {
 }
 
 // ───────────────────────────────────────────────
+// Normalizar texto (minúsculas, sin tildes ni signos)
+// ───────────────────────────────────────────────
+function normalizeText(s = "") {
+  return s
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ───────────────────────────────────────────────
 // Capturar foto (prueba todos los nombres del SDK)
 // ───────────────────────────────────────────────
 async function handlePhoto(session, deviceId) {
   try {
     try { session.layouts?.showTextWall?.("Capturando..."); } catch {}
-
-    console.log("[CAO-S] session keys:", Object.keys(session || {}));
-    console.log(
-      "[CAO-S] camera?:", !!session?.camera,
-      "| photos?:", !!session?.photos,
-      "| capture?:", typeof session?.capturePhoto
-    );
 
     let photo;
     if (typeof session?.camera?.requestPhoto === "function") {
@@ -102,11 +108,6 @@ async function handlePhoto(session, deviceId) {
       try { session.layouts?.showTextWall?.("Cámara no disponible"); } catch {}
       return;
     }
-
-    console.log(
-      "[CAO-S] Foto OK, tipo:", typeof photo,
-      "claves:", photo && Object.keys(photo)
-    );
 
     const raw =
       photo?.base64 || photo?.data || photo?.image || photo?.buffer || null;
@@ -138,7 +139,7 @@ async function handlePhoto(session, deviceId) {
     if (result.body?.includes("glasses_orphan")) {
       try { session.layouts?.showTextWall?.("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
     } else if (result.body?.includes("no_target_work")) {
-      try { session.layouts?.showTextWall?.("Sin obra activa en CAO-S."); } catch {}
+      try { session.layouts?.showTextWall?.("Acércate a una obra del día o ficha."); } catch {}
     } else {
       try { session.layouts?.showTextWall?.("Foto enviada al diario ✓"); } catch {}
     }
@@ -157,7 +158,7 @@ class CaosServer extends ServerBase {
     const deviceModel = session.device?.model ?? "Mentra";
     console.log(`[CAO-S] Sesión abierta device_id=${deviceId} model=${deviceModel}`);
 
-    try { session.layouts.showTextWall("CAO-S conectado. Di 'foto' o pulsa el botón."); } catch {}
+    try { session.layouts.showTextWall("CAO-S listo. Di 'hola caos' para activar."); } catch {}
 
     await sendToCaos({
       device_id: deviceId,
@@ -180,16 +181,36 @@ class CaosServer extends ServerBase {
       clearInterval(timer);
     });
 
+    // Estado de escucha activa por sesión
+    let awakeUntil = 0;
+
     session.events.onTranscription?.(async (data) => {
       try {
         if (!data?.isFinal) return;
-        const text = (data.text || "").toLowerCase().trim();
+        const text = normalizeText(data.text || "");
+        if (!text) return;
+
+        // Wake-word: "hola caos" → abre ventana de 8 s
+        if (text.includes("hola caos")) {
+          awakeUntil = Date.now() + WAKE_MS;
+          console.log("[CAO-S] Despierto 8s");
+          try { session.layouts?.showTextWall?.("Caos te escucha", { duration: 1500 }); } catch {}
+        }
+
+        // Comando 'foto' SOLO si está despierto
         if (/\b(foto|captura|capturar|saca\s+foto)\b/.test(text)) {
-          await handlePhoto(session, deviceId);
+          if (Date.now() < awakeUntil) {
+            console.log("[CAO-S] Foto por voz");
+            await handlePhoto(session, deviceId);
+            // Mantenemos la ventana abierta para encadenar más fotos
+          } else {
+            console.log("[CAO-S] 'foto' ignorada (gafas dormidas)");
+          }
         }
       } catch (e) { console.error("[CAO-S] Voz:", e?.message || e); }
     });
 
+    // El botón físico siempre dispara, sin necesidad de wake-word
     session.events.onButtonPress?.(async () => {
       try { await handlePhoto(session, deviceId); }
       catch (e) { console.error("[CAO-S] Botón:", e?.message || e); }
