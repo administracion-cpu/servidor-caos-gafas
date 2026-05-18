@@ -66,15 +66,28 @@ async function speakIfPresent(session, resp) {
 
 async function handlePhoto(session, deviceId, extra = {}) {
   try {
-    if (session.layouts?.showTextWall) session.layouts.showTextWall("📸 Haciendo foto…", { durationMs: 1500 });
-    const photo = await session.camera.requestPhoto();
+    if (session.layouts?.showTextWall) session.layouts.showTextWall("📸 Haciendo foto…", { durationMs: 2500 });
+
+    // Damos hasta 20s a la cámara (antes ~5s por defecto)
+    const PHOTO_TIMEOUT_MS = 20000;
+    let photo;
+    try {
+      photo = await session.camera.requestPhoto({ timeoutMs: PHOTO_TIMEOUT_MS });
+    } catch (e1) {
+      // Algunos SDK no aceptan opciones: reintento sin opciones
+      console.warn("[CAO-S] requestPhoto con timeout falló, reintento simple:", e1?.message || e1);
+      photo = await session.camera.requestPhoto();
+    }
+
     const base64 = photo?.buffer
       ? Buffer.from(photo.buffer).toString("base64")
       : photo?.base64 || null;
     if (!base64) {
       console.warn("[CAO-S] La cámara devolvió vacío");
+      if (session.layouts?.showTextWall) session.layouts.showTextWall("⚠️ Cámara vacía", { durationMs: 2000 });
       return;
     }
+
     const resp = await postToCaos({
       device_id: deviceId,
       event_type: "photo",
@@ -87,10 +100,15 @@ async function handlePhoto(session, deviceId, extra = {}) {
     }, `FOTO ${deviceId}`);
     await speakIfPresent(session, resp);
   } catch (e) {
-    console.error("[CAO-S] Foto falló:", e?.message || e);
-    if (session.layouts?.showTextWall) session.layouts.showTextWall("⚠️ No pude hacer la foto", { durationMs: 2000 });
+    const msg = String(e?.message || e);
+    console.error("[CAO-S] Foto falló:", msg);
+    const userMsg = msg.includes("timed out")
+      ? "⚠️ Cámara tardó demasiado, repite"
+      : "⚠️ No pude hacer la foto";
+    if (session.layouts?.showTextWall) session.layouts.showTextWall(userMsg, { durationMs: 2500 });
   }
 }
+
 
 function normalize(s) {
   return (s || "")
