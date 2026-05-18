@@ -1,7 +1,10 @@
 // Servidor puente CAO-S <-> Gafas Mentra
-// Recibe fotos desde las gafas Mentra y las reenvía al diario de obra del usuario en CAO-S.
-// Arreglar import appServer
+// - Manda LATIDOS a CAO-S cuando las gafas se encienden y cada 30s.
+// - Manda FOTOS cuando dices "foto" o pulsas el botón.
+// - Usa device_id estable (el userId de Mentra) para que CAO-S sepa quién es.
+
 import * as MentraSDK from "@mentra/sdk";
+import fetch from "node-fetch";
 
 const ServerBase =
   MentraSDK.AppServer ||
@@ -10,12 +13,9 @@ const ServerBase =
   MentraSDK.default?.TpaServer;
 
 if (!ServerBase) {
-  console.error("No encuentro servidor Mentra:", Object.keys(MentraSDK));
+  console.error("[CAO-S] No encuentro servidor Mentra en el SDK:", Object.keys(MentraSDK));
   process.exit(1);
 }
-
-
-import fetch from "node-fetch";
 
 const {
   MENTRA_API_KEY,
@@ -26,13 +26,11 @@ const {
 } = process.env;
 
 if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BRIDGE_URL) {
-  console.error("[CAO-S] Faltan variables de entorno. Revisa MENTRA_API_KEY, MENTRA_PACKAGE_NAME, MENTRA_BRIDGE_SECRET, CAOS_BRIDGE_URL");
+  console.error("[CAO-S] Faltan variables de entorno: MENTRA_API_KEY, MENTRA_PACKAGE_NAME, MENTRA_BRIDGE_SECRET, CAOS_BRIDGE_URL");
   process.exit(1);
 }
 
-// Mapa en memoria: userId Mentra -> pairing_code CAO-S del usuario.
-// El operario dice por voz "emparejar 123456" para vincular las gafas.
-const pairingByUser = new Map();
+const HEARTBEAT_MS = 30_000;
 
 const server = new ServerBase({
   packageName: MENTRA_PACKAGE_NAME,
@@ -40,80 +38,112 @@ const server = new ServerBase({
   port: Number(PORT),
 });
 
-server.onSession(async (session, sessionId, userId) => {
-  console.log(`[CAO-S] Sesión abierta: user=${userId}`);
-  session.layouts.showTextWall("CAO-S listo. Di 'emparejar 123456' para vincular.");
-
-  // Escuchar transcripciones para capturar el código de emparejamiento
-  session.events.onTranscription(async (data) => {
-    if (!data.isFinal) return;
-    const text = (data.text || "").toLowerCase().trim();
-
-    // "emparejar 123456" o "vincular 123456"
-    const m = text.match(/(?:empareja(?:r)?|vincula(?:r)?)\s+(\d{6})/);
-    if (m) {
-      const code = m[1];
-      pairingByUser.set(userId, code);
-      console.log(`[CAO-S] user=${userId} emparejado con ${code}`);
-      session.layouts.showTextWall(`Emparejado con CAO-S (${code}). Di 'foto' para capturar.`);
-      return;
-    }
-
-    // "foto" o "captura" -> sacar foto
-    if (/\b(foto|captura|capturar|saca foto)\b/.test(text)) {
-      await takePhoto(session, userId);
-    }
-  });
-
-  // Algunos firmwares emiten un evento de botón al pulsar las gafas
-  session.events.onButtonPress?.(async () => {
-    await takePhoto(session, userId);
-  });
-});
-
-async function takePhoto(session, userId) {
-  const pairingCode = pairingByUser.get(userId);
-  if (!pairingCode) {
-    session.layouts.showTextWall("No emparejado. Di 'emparejar 123456'.");
-    return;
-  }
+// Llamada genérica al puente de CAO-S
+async function sendToCaos(payload) {
   try {
-    session.layouts.showTextWall("Capturando...");
-    const photo = await session.camera.requestPhoto(); // { buffer, mimeType }
-    const b64 = Buffer.from(photo.buffer).toString("base64");
-
-    const battery = session.device?.batteryLevel ?? null;
-    const model = session.device?.model ?? "Mentra";
-
     const res = await fetch(CAOS_BRIDGE_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-mentra-secret": MENTRA_BRIDGE_SECRET,
       },
-      body: JSON.stringify({
-        pairing_code: pairingCode,
-        photo_base64: b64,
-        photo_mime: photo.mimeType || "image/jpeg",
-        battery_level: battery,
-        device_model: model,
-        captured_at: new Date().toISOString(),
-      }),
+      body: JSON.stringify(payload),
+    });
+    const txt = await res.text();
+    if (!res.ok) {
+      console.error(`[CAO-S] Puente respondió ${res.status}:`, txt);
+      return { ok: false, status: res.status, body: txt };
+    }
+    console.log(`[CAO-S] OK ${payload.event_type || "photo"} → ${txt}`);
+    return { ok: true, status: res.status, body: txt };
+  } catch (e) {
+    console.error("[CAO-S] Error de red llamando al puente:", e?.message || e);
+    return { ok: false, error: String(e) };
+  }
+}
+
+server.onSession(async (session, sessionId, userId) => {
+  const deviceId = String(userId); // Identificador estable de estas gafas
+  const deviceModel = session.device?.model ?? "Mentra";
+  console.log(`[CAO-S] Sesión abierta. device_id=${deviceId} model=${deviceModel}`);
+
+  session.layouts.showTextWall("CAO-S conectado. Di 'foto' o pulsa el botón.");
+
+  // 1) Latido inmediato para que CAO-S registre las gafas
+  await sendToCaos({
+    device_id: deviceId,
+    event_type: "heartbeat",
+    device_model: deviceModel,
+    battery_level: session.device?.batteryLevel ?? null,
+  });
+
+  // 2) Latido periódico mientras la sesión esté abierta
+  const heartbeatTimer = setInterval(() => {
+    sendToCaos({
+      device_id: deviceId,
+      event_type: "heartbeat",
+      device_model: session.device?.model ?? deviceModel,
+      battery_level: session.device?.batteryLevel ?? null,
+    });
+  }, HEARTBEAT_MS);
+
+  // Cuando se cierre la sesión, parar latidos
+  session.events.onDisconnected?.(() => {
+    console.log(`[CAO-S] Sesión cerrada device_id=${deviceId}`);
+    clearInterval(heartbeatTimer);
+  });
+
+  // 3) Escuchar voz: "foto" / "captura" / "saca foto"
+  session.events.onTranscription(async (data) => {
+    if (!data.isFinal) return;
+    const text = (data.text || "").toLowerCase().trim();
+    if (/\b(foto|captura|capturar|saca\s+foto)\b/.test(text)) {
+      await takePhoto(session, deviceId);
+    }
+  });
+
+  // 4) Botón físico de las gafas (si el firmware lo emite)
+  session.events.onButtonPress?.(async () => {
+    await takePhoto(session, deviceId);
+  });
+});
+
+async function takePhoto(session, deviceId) {
+  try {
+    session.layouts.showTextWall("Capturando...");
+    const photo = await session.camera.requestPhoto(); // { buffer, mimeType }
+    const b64 = Buffer.from(photo.buffer).toString("base64");
+
+    const result = await sendToCaos({
+      device_id: deviceId,
+      event_type: "photo",
+      photo_base64: b64,
+      photo_mime: photo.mimeType || "image/jpeg",
+      battery_level: session.device?.batteryLevel ?? null,
+      device_model: session.device?.model ?? "Mentra",
+      captured_at: new Date().toISOString(),
     });
 
-    if (!res.ok) {
-      const txt = await res.text();
-      console.error("[CAO-S] Error subiendo foto:", res.status, txt);
-      session.layouts.showTextWall("Error: " + res.status);
+    if (!result.ok) {
+      session.layouts.showTextWall(`Error ${result.status || ""}`.trim());
       return;
     }
-    session.layouts.showTextWall("Foto enviada al diario ✓");
+
+    // Mensaje según respuesta de CAO-S
+    if (result.body?.includes("glasses_orphan")) {
+      session.layouts.showTextWall("Gafas sin dueño. Reclámalas en CAO-S ('Son mías').");
+    } else if (result.body?.includes("no_target_work")) {
+      session.layouts.showTextWall("Sin obra activa. Empieza una en CAO-S.");
+    } else {
+      session.layouts.showTextWall("Foto enviada al diario ✓");
+    }
   } catch (e) {
-    console.error("[CAO-S] Excepción foto:", e);
+    console.error("[CAO-S] Excepción capturando foto:", e);
     session.layouts.showTextWall("Error al capturar");
   }
 }
 
 server.start().then(() => {
   console.log(`[CAO-S] Servidor de gafas escuchando en puerto ${PORT}`);
+  console.log(`[CAO-S] Reenviando a: ${CAOS_BRIDGE_URL}`);
 });
