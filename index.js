@@ -45,28 +45,59 @@ process.on("unhandledRejection", (r) => {
 
 const HEARTBEAT_MS = 30_000;
 
-async function sendToCaos(payload) {
+async function handlePhoto(session, userId) {
   try {
-    const res = await fetch(CAOS_BRIDGE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-mentra-secret": MENTRA_BRIDGE_SECRET,
-      },
-      body: JSON.stringify(payload),
-    });
-    const txt = await res.text();
-    if (!res.ok) {
-      console.error(`[CAO-S] Puente respondió ${res.status}:`, txt);
-      return { ok: false, status: res.status, body: txt };
+    // 1) Log de qué tiene la sesión por dentro
+    console.log("[CAO-S] session keys:", Object.keys(session || {}));
+    console.log("[CAO-S] camera?:", !!session?.camera,
+                "| photos?:", !!session?.photos,
+                "| capture?:", typeof session?.capturePhoto);
+
+    // 2) Probar todos los nombres conocidos
+    let photo;
+    if (typeof session?.camera?.requestPhoto === "function") {
+      photo = await session.camera.requestPhoto();
+    } else if (typeof session?.photos?.requestPhoto === "function") {
+      photo = await session.photos.requestPhoto();
+    } else if (typeof session?.camera?.takePhoto === "function") {
+      photo = await session.camera.takePhoto();
+    } else if (typeof session?.capturePhoto === "function") {
+      photo = await session.capturePhoto();
+    } else if (typeof session?.requestPhoto === "function") {
+      photo = await session.requestPhoto();
+    } else {
+      console.error("[CAO-S] No hay API de foto en esta sesión");
+      session.layouts?.showTextWall?.("Cámara no disponible");
+      return;
     }
-    console.log(`[CAO-S] OK ${payload.event_type || "photo"} → ${txt}`);
-    return { ok: true, status: res.status, body: txt };
+
+    console.log("[CAO-S] Foto OK, tipo:", typeof photo, "claves:", photo && Object.keys(photo));
+
+    // 3) Sacar el base64 (varía según versión: photo.base64 / photo.data / photo.image)
+    const base64 =
+      photo?.base64 || photo?.data || photo?.image || photo?.buffer || null;
+    const mime = photo?.mimeType || photo?.mime || "image/jpeg";
+
+    if (!base64) {
+      console.error("[CAO-S] La foto llegó pero sin base64:", photo);
+      session.layouts?.showTextWall?.("Foto vacía");
+      return;
+    }
+
+    const res = await sendToCaos({
+      device_id: userId,
+      event_type: "photo",
+      photo_base64: typeof base64 === "string" ? base64 : Buffer.from(base64).toString("base64"),
+      photo_mime: mime,
+    });
+
+    session.layouts?.showTextWall?.(res?.ok ? "Foto enviada ✓" : "Sin obra activa");
   } catch (e) {
-    console.error("[CAO-S] Error red:", e?.message || e);
-    return { ok: false, error: String(e) };
+    console.error("[CAO-S] Excepción foto:", e?.message || e);
+    session.layouts?.showTextWall?.("Error al capturar");
   }
 }
+
 
 // ✅ HAY QUE SUBCLASEAR y sobrescribir onSession, no pasarlo como callback
 class CaosServer extends ServerBase {
