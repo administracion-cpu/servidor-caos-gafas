@@ -120,10 +120,12 @@ async function handlePhoto(session, deviceId) {
       captured_at: new Date().toISOString(),
     });
 
-    if (!result.ok) {
+        if (!result.ok) {
       try { session.layouts?.showTextWall?.(`Error ${result.status || ""}`.trim()); } catch {}
       return;
     }
+
+    // Mensaje en pantalla según respuesta
     if (result.body?.includes("glasses_orphan")) {
       try { session.layouts?.showTextWall?.("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
     } else if (result.body?.includes("no_target_work")) {
@@ -131,11 +133,31 @@ async function handlePhoto(session, deviceId) {
     } else {
       try { session.layouts?.showTextWall?.("Foto enviada al diario ✓"); } catch {}
     }
-  } catch (e) {
-    console.error("[CAO-S] Excepción foto:", e?.message || e);
-    try { session.layouts?.showTextWall?.("Error al capturar"); } catch {}
-  }
-}
+
+    // 🔊 Reproducir voz de CAO-S si viene en la respuesta
+    const speak = result.data?.speak;
+    const audioB64 = speak?.audio_base64 || result.data?.audio_base64;
+    const audioMime = speak?.mime || speak?.audio_mime || "audio/mpeg";
+    if (audioB64) {
+      try {
+        const dataUrl = `data:${audioMime};base64,${audioB64}`;
+        if (typeof session.audio?.playAudio === "function") {
+          await session.audio.playAudio({ audioUrl: dataUrl });
+        } else if (typeof session.audio?.play === "function") {
+          await session.audio.play({ audioUrl: dataUrl });
+        } else if (typeof session.layouts?.playAudio === "function") {
+          await session.layouts.playAudio({ audioUrl: dataUrl });
+        } else {
+          console.warn("[CAO-S] No encuentro API de audio en la sesión:", Object.keys(session || {}));
+        }
+        console.log(`[CAO-S] 🔊 voz reproducida (${audioB64.length} chars b64)`);
+      } catch (e) {
+        console.error("[CAO-S] Error reproduciendo voz:", e?.message || e);
+      }
+    } else {
+      console.log("[CAO-S] La respuesta no traía audio para hablar");
+    }
+
 
 // ───────────────────────────────────────────────
 // Filtro "oye caos" + ventana de 8 segundos
