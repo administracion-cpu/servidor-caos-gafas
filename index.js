@@ -246,6 +246,11 @@ function handleHeardText(session, deviceId, rawText) {
 class CaosServer extends ServerBase {
   async onSession(session, sessionId, userId) {
     const deviceId = String(userId);
+    try {
+  console.log("[CAO-S] events disponibles:", Object.keys(session.events || {}));
+  console.log("[CAO-S] session keys:", Object.keys(session || {}));
+} catch (e) { console.log("[CAO-S] no pude listar events:", e?.message); }
+
     const deviceModel = session.device?.model ?? "Mentra";
     console.log(`[CAO-S] Sesión abierta device_id=${deviceId} model=${deviceModel}`);
 
