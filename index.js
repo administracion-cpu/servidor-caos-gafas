@@ -45,15 +45,47 @@ process.on("unhandledRejection", (r) => {
 
 const HEARTBEAT_MS = 30_000;
 
-async function handlePhoto(session, userId) {
+// ───────────────────────────────────────────────
+// Enviar cualquier evento al puente de CAO-S
+// ───────────────────────────────────────────────
+async function sendToCaos(payload) {
   try {
-    // 1) Log de qué tiene la sesión por dentro
-    console.log("[CAO-S] session keys:", Object.keys(session || {}));
-    console.log("[CAO-S] camera?:", !!session?.camera,
-                "| photos?:", !!session?.photos,
-                "| capture?:", typeof session?.capturePhoto);
+    const res = await fetch(CAOS_BRIDGE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-mentra-secret": MENTRA_BRIDGE_SECRET,
+      },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+    console.log(
+      `[CAO-S] ${res.ok ? "OK" : "FAIL"} ${payload.event_type} →`,
+      JSON.stringify(data)
+    );
+    return { ok: res.ok, status: res.status, body: text, data };
+  } catch (e) {
+    console.error("[CAO-S] Error enviando a CAO-S:", e?.message || e);
+    return { ok: false, status: 0, body: "", data: null };
+  }
+}
 
-    // 2) Probar todos los nombres conocidos
+// ───────────────────────────────────────────────
+// Capturar foto (prueba todos los nombres del SDK)
+// ───────────────────────────────────────────────
+async function handlePhoto(session, deviceId) {
+  try {
+    try { session.layouts?.showTextWall?.("Capturando..."); } catch {}
+
+    console.log("[CAO-S] session keys:", Object.keys(session || {}));
+    console.log(
+      "[CAO-S] camera?:", !!session?.camera,
+      "| photos?:", !!session?.photos,
+      "| capture?:", typeof session?.capturePhoto
+    );
+
     let photo;
     if (typeof session?.camera?.requestPhoto === "function") {
       photo = await session.camera.requestPhoto();
@@ -67,39 +99,58 @@ async function handlePhoto(session, userId) {
       photo = await session.requestPhoto();
     } else {
       console.error("[CAO-S] No hay API de foto en esta sesión");
-      session.layouts?.showTextWall?.("Cámara no disponible");
+      try { session.layouts?.showTextWall?.("Cámara no disponible"); } catch {}
       return;
     }
 
-    console.log("[CAO-S] Foto OK, tipo:", typeof photo, "claves:", photo && Object.keys(photo));
+    console.log(
+      "[CAO-S] Foto OK, tipo:", typeof photo,
+      "claves:", photo && Object.keys(photo)
+    );
 
-    // 3) Sacar el base64 (varía según versión: photo.base64 / photo.data / photo.image)
-    const base64 =
+    const raw =
       photo?.base64 || photo?.data || photo?.image || photo?.buffer || null;
     const mime = photo?.mimeType || photo?.mime || "image/jpeg";
 
-    if (!base64) {
-      console.error("[CAO-S] La foto llegó pero sin base64:", photo);
-      session.layouts?.showTextWall?.("Foto vacía");
+    if (!raw) {
+      console.error("[CAO-S] La foto llegó pero sin datos:", photo);
+      try { session.layouts?.showTextWall?.("Foto vacía"); } catch {}
       return;
     }
 
-    const res = await sendToCaos({
-      device_id: userId,
+    const base64 =
+      typeof raw === "string" ? raw : Buffer.from(raw).toString("base64");
+
+    const result = await sendToCaos({
+      device_id: deviceId,
       event_type: "photo",
-      photo_base64: typeof base64 === "string" ? base64 : Buffer.from(base64).toString("base64"),
+      photo_base64: base64,
       photo_mime: mime,
+      battery_level: session.device?.batteryLevel ?? null,
+      device_model: session.device?.model ?? "Mentra",
+      captured_at: new Date().toISOString(),
     });
 
-    session.layouts?.showTextWall?.(res?.ok ? "Foto enviada ✓" : "Sin obra activa");
+    if (!result.ok) {
+      try { session.layouts?.showTextWall?.(`Error ${result.status || ""}`.trim()); } catch {}
+      return;
+    }
+    if (result.body?.includes("glasses_orphan")) {
+      try { session.layouts?.showTextWall?.("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
+    } else if (result.body?.includes("no_target_work")) {
+      try { session.layouts?.showTextWall?.("Sin obra activa en CAO-S."); } catch {}
+    } else {
+      try { session.layouts?.showTextWall?.("Foto enviada al diario ✓"); } catch {}
+    }
   } catch (e) {
     console.error("[CAO-S] Excepción foto:", e?.message || e);
-    session.layouts?.showTextWall?.("Error al capturar");
+    try { session.layouts?.showTextWall?.("Error al capturar"); } catch {}
   }
 }
 
-
-// ✅ HAY QUE SUBCLASEAR y sobrescribir onSession, no pasarlo como callback
+// ───────────────────────────────────────────────
+// Servidor Mentra (subclase con onSession)
+// ───────────────────────────────────────────────
 class CaosServer extends ServerBase {
   async onSession(session, sessionId, userId) {
     const deviceId = String(userId);
@@ -134,48 +185,15 @@ class CaosServer extends ServerBase {
         if (!data?.isFinal) return;
         const text = (data.text || "").toLowerCase().trim();
         if (/\b(foto|captura|capturar|saca\s+foto)\b/.test(text)) {
-          await takePhoto(session, deviceId);
+          await handlePhoto(session, deviceId);
         }
       } catch (e) { console.error("[CAO-S] Voz:", e?.message || e); }
     });
 
     session.events.onButtonPress?.(async () => {
-      try { await takePhoto(session, deviceId); }
+      try { await handlePhoto(session, deviceId); }
       catch (e) { console.error("[CAO-S] Botón:", e?.message || e); }
     });
-  }
-}
-
-async function takePhoto(session, deviceId) {
-  try {
-    try { session.layouts.showTextWall("Capturando..."); } catch {}
-    const photo = await session.camera.requestPhoto();
-    const b64 = Buffer.from(photo.buffer).toString("base64");
-
-    const result = await sendToCaos({
-      device_id: deviceId,
-      event_type: "photo",
-      photo_base64: b64,
-      photo_mime: photo.mimeType || "image/jpeg",
-      battery_level: session.device?.batteryLevel ?? null,
-      device_model: session.device?.model ?? "Mentra",
-      captured_at: new Date().toISOString(),
-    });
-
-    if (!result.ok) {
-      try { session.layouts.showTextWall(`Error ${result.status || ""}`.trim()); } catch {}
-      return;
-    }
-    if (result.body?.includes("glasses_orphan")) {
-      try { session.layouts.showTextWall("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
-    } else if (result.body?.includes("no_target_work")) {
-      try { session.layouts.showTextWall("Sin obra activa en CAO-S."); } catch {}
-    } else {
-      try { session.layouts.showTextWall("Foto enviada al diario ✓"); } catch {}
-    }
-  } catch (e) {
-    console.error("[CAO-S] Excepción foto:", e?.message || e);
-    try { session.layouts.showTextWall("Error al capturar"); } catch {}
   }
 }
 
