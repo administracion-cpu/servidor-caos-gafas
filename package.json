@@ -8,10 +8,10 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@mentra/sdk": "^2.1.29",
-    "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
-  },
+  "@mentra/sdk": "^2.1.29",
+  "express": "^4.19.2",
+  "node-fetch": "^3.3.2"
+}
   "engines": {
     "node": ">=20"
   }
