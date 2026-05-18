@@ -27,12 +27,8 @@ if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BR
   process.exit(1);
 }
 
-// Ventana de escucha tras oír "oye caos"
 const WAKE_WINDOW_MS = 8000;
 
-// ──────────────────────────────────────────────────────────────
-// Envío al webhook de CAO-S (foto o latido). Log claro siempre.
-// ──────────────────────────────────────────────────────────────
 async function postToCaos(payload, label) {
   try {
     const r = await fetch(CAOS_BRIDGE_URL, {
@@ -68,9 +64,6 @@ async function speakIfPresent(session, resp) {
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-// Tomar foto y mandarla
-// ──────────────────────────────────────────────────────────────
 async function handlePhoto(session, deviceId, extra = {}) {
   try {
     if (session.layouts?.showTextWall) session.layouts.showTextWall("📸 Haciendo foto…", { durationMs: 1500 });
@@ -99,9 +92,6 @@ async function handlePhoto(session, deviceId, extra = {}) {
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-// Wake word "oye caos" + comando
-// ──────────────────────────────────────────────────────────────
 function normalize(s) {
   return (s || "")
     .toString()
@@ -149,58 +139,6 @@ function tryAttach(session, name, cb) {
   return null;
 }
 
-// NUEVO: pedir a las gafas que enciendan micro y manden transcripción.
-// Probamos varias formas porque distintas versiones del SDK lo exponen distinto.
-async function enableVoice(session) {
-  const lang = "es-ES";
-  const tried = [];
-
-  // 1) API moderna: subscribe a un stream
-  try {
-    if (typeof session?.subscribe === "function") {
-      await session.subscribe({ stream: "transcription", language: lang, interim: true });
-      tried.push("subscribe(transcription)");
-    }
-  } catch (e) { tried.push(`subscribe ERR:${e?.message || e}`); }
-
-  // 2) startTranscription / startSpeech / startListening
-  for (const fn of ["startTranscription", "startSpeech", "startListening", "enableMicrophone"]) {
-    try {
-      if (typeof session?.[fn] === "function") {
-        await session[fn]({ language: lang, interim: true, continuous: true });
-        tried.push(fn);
-      } else if (typeof session?.voice?.[fn] === "function") {
-        await session.voice[fn]({ language: lang, interim: true, continuous: true });
-        tried.push(`voice.${fn}`);
-      } else if (typeof session?.speech?.[fn] === "function") {
-        await session.speech[fn]({ language: lang, interim: true, continuous: true });
-        tried.push(`speech.${fn}`);
-      }
-    } catch (e) { tried.push(`${fn} ERR:${e?.message || e}`); }
-  }
-
-  // 3) setMicrophoneEnabled / mic.enable
-  try {
-    if (typeof session?.setMicrophoneEnabled === "function") {
-      await session.setMicrophoneEnabled(true);
-      tried.push("setMicrophoneEnabled(true)");
-    } else if (typeof session?.microphone?.enable === "function") {
-      await session.microphone.enable();
-      tried.push("microphone.enable()");
-    } else if (typeof session?.mic?.enable === "function") {
-      await session.mic.enable();
-      tried.push("mic.enable()");
-    }
-  } catch (e) { tried.push(`mic ERR:${e?.message || e}`); }
-
-  if (tried.length) {
-    console.log(`[CAO-S] Canal de voz solicitado: ${tried.join(" | ")}`);
-  } else {
-    console.warn("[CAO-S] ⚠️ El SDK no expone forma conocida de encender el micro. Claves session:", Object.keys(session || {}));
-    if (session.layouts?.showTextWall) session.layouts.showTextWall("Sin permiso de voz", { durationMs: 3000 });
-  }
-}
-
 function attachTranscript(session, deviceId) {
   const candidates = [
     "onTranscription", "onTranscript", "onUserTranscript",
@@ -222,7 +160,7 @@ function attachTranscript(session, deviceId) {
     session.events ? Object.keys(session.events) : "(sin events)");
 }
 
-const armed = new Map(); // deviceId -> timeoutId
+const armed = new Map();
 
 function handleHeardText(session, deviceId, rawText) {
   const text = normalize(rawText);
@@ -241,7 +179,10 @@ function handleHeardText(session, deviceId, rawText) {
     return;
   }
 
-  if (!armed.has(deviceId)) return;
+  if (!armed.has(deviceId)) {
+    console.log(`[CAO-S] (ignorado, falta "oye caos"): "${text}"`);
+    return;
+  }
   clearTimeout(armed.get(deviceId));
   armed.delete(deviceId);
   runCommand(session, deviceId, text);
@@ -254,9 +195,6 @@ async function runCommand(session, deviceId, raw) {
   if (session.layouts?.showTextWall) session.layouts.showTextWall("Ese comando aún no lo entiendo", { durationMs: 2000 });
 }
 
-// ──────────────────────────────────────────────────────────────
-// Botón físico
-// ──────────────────────────────────────────────────────────────
 function attachButton(session, deviceId) {
   const candidates = ["onButtonPress", "onButton", "onHardwareButton", "onTap"];
   const cb = () => handlePhoto(session, deviceId);
@@ -270,9 +208,6 @@ function attachButton(session, deviceId) {
   console.warn("[CAO-S] ⚠️ No encontré evento de botón en el SDK");
 }
 
-// ──────────────────────────────────────────────────────────────
-// Latidos periódicos
-// ──────────────────────────────────────────────────────────────
 function attachHeartbeat(session, deviceId) {
   const id = setInterval(() => {
     postToCaos({
@@ -285,9 +220,6 @@ function attachHeartbeat(session, deviceId) {
   session.onDisconnect?.(() => clearInterval(id));
 }
 
-// ──────────────────────────────────────────────────────────────
-// Servidor
-// ──────────────────────────────────────────────────────────────
 class CaosServer extends ServerBase {
   async onSession(session, sessionId, userId) {
     const deviceId = session.device?.id || sessionId || userId || "unknown";
@@ -295,7 +227,6 @@ class CaosServer extends ServerBase {
 
     attachHeartbeat(session, deviceId);
     attachTranscript(session, deviceId);
-    await enableVoice(session); // 👈 IMPORTANTE: enciende micro + transcripción
     attachButton(session, deviceId);
 
     if (session.layouts?.showTextWall) {
