@@ -27,6 +27,9 @@ if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BR
   process.exit(1);
 }
 
+// Ventana de escucha tras oír "oye caos"
+const WAKE_WINDOW_MS = 8000;
+
 // ──────────────────────────────────────────────────────────────
 // Envío al webhook de CAO-S (foto o latido). Log claro siempre.
 // ──────────────────────────────────────────────────────────────
@@ -100,39 +103,72 @@ async function handlePhoto(session, deviceId, extra = {}) {
 // ──────────────────────────────────────────────────────────────
 // Wake word "oye caos" + comando
 // ──────────────────────────────────────────────────────────────
-const WAKE = /\boye\s+ca[oó]s\b/i;
-const PHOTO_CMDS = [/\bfoto\b/i, /\bhazme\s+(una\s+)?foto\b/i, /\bsaca(?:r)?\s+(una\s+)?foto\b/i];
+// Normaliza: minúsculas, sin acentos, sin signos, espacios colapsados
+function normalize(s) {
+  return (s || "")
+    .toString()
+    .toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[.,;:!?¿¡"'()\-_/\\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-function matchCommand(text) {
-  if (!text) return null;
-  if (PHOTO_CMDS.some((rx) => rx.test(text))) return "photo";
+const WAKE = /\boye\s+(c|k)aos\b/;
+const PHOTO_CMDS = [
+  /\bfoto\b/,
+  /\bfotografia\b/,
+  /\bhaz(me)?\s+(una\s+)?foto\b/,
+  /\bsaca(me)?\s+(una\s+)?foto\b/,
+  /\btomar?\s+(una\s+)?foto\b/,
+];
+
+function matchCommand(textNorm) {
+  if (!textNorm) return null;
+  if (PHOTO_CMDS.some((rx) => rx.test(textNorm))) return "photo";
   return "unknown";
 }
 
+function tryAttach(session, name, cb) {
+  // Probamos 3 formas de enganchar el evento, según cómo lo exponga el SDK
+  try {
+    if (typeof session?.events?.[name] === "function") {
+      session.events[name](cb);
+      return `events.${name}`;
+    }
+  } catch {}
+  try {
+    if (typeof session?.[name] === "function") {
+      session[name](cb);
+      return name;
+    }
+  } catch {}
+  try {
+    if (typeof session?.events?.on === "function") {
+      session.events.on(name, cb);
+      return `events.on("${name}")`;
+    }
+  } catch {}
+  return null;
+}
+
 function attachTranscript(session, deviceId) {
-  // Probar varios nombres del SDK para enganchar transcripción
   const candidates = [
     "onTranscription", "onTranscript", "onUserTranscript",
-    "onSpeech", "onSpeechRecognition", "onVoice",
+    "onSpeech", "onSpeechRecognition", "onVoice", "onUtterance",
   ];
-  let attached = null;
+  const cb = (evt) => {
+    const text = (evt?.text ?? evt?.transcript ?? evt?.utterance ?? evt ?? "").toString().trim();
+    if (!text) return;
+    console.log(`[CAO-S] 🎙️  ${text}`);
+    handleHeardText(session, deviceId, text);
+  };
+  const hooked = [];
   for (const name of candidates) {
-    if (typeof session.events?.[name] === "function") {
-      try {
-        session.events[name]((evt) => {
-          const text = (evt?.text ?? evt?.transcript ?? evt?.utterance ?? "").toString().trim();
-          if (!text) return;
-          console.log(`[CAO-S] 🎙️  ${text}`);
-          handleHeardText(session, deviceId, text);
-        });
-        attached = name;
-        break;
-      } catch (e) {
-        console.warn(`[CAO-S] ${name} no se pudo enganchar:`, e?.message || e);
-      }
-    }
+    const how = tryAttach(session, name, cb);
+    if (how) hooked.push(how);
   }
-  if (attached) console.log(`[CAO-S] Escucha de voz activa vía ${attached}`);
+  if (hooked.length) console.log(`[CAO-S] Escucha de voz activa vía: ${hooked.join(", ")}`);
   else console.warn("[CAO-S] ⚠️ No encontré evento de transcripción en el SDK. Claves disponibles:",
     session.events ? Object.keys(session.events) : "(sin events)");
 }
@@ -140,22 +176,24 @@ function attachTranscript(session, deviceId) {
 // Estado de "ventana de comando" tras oír "oye caos"
 const armed = new Map(); // deviceId -> timeoutId
 
-function handleHeardText(session, deviceId, text) {
+function handleHeardText(session, deviceId, rawText) {
+  const text = normalize(rawText);
   const hasWake = WAKE.test(text);
-  // Si la frase ya contiene wake + comando, ejecuta de una
+
   if (hasWake) {
     const tail = text.replace(WAKE, "").trim();
     if (tail) {
       runCommand(session, deviceId, tail);
       return;
     }
-    // Solo "oye caos" → abre ventana de 5s
+    // Solo "oye caos" → abre ventana de escucha
     if (armed.has(deviceId)) clearTimeout(armed.get(deviceId));
-    armed.set(deviceId, setTimeout(() => armed.delete(deviceId), 5000));
-    if (session.layouts?.showTextWall) session.layouts.showTextWall("Te escucho…", { durationMs: 1500 });
-    console.log(`[CAO-S] Wake activo, esperando comando 5s (${deviceId})`);
+    armed.set(deviceId, setTimeout(() => armed.delete(deviceId), WAKE_WINDOW_MS));
+    if (session.layouts?.showTextWall) session.layouts.showTextWall("Te escucho…", { durationMs: WAKE_WINDOW_MS });
+    console.log(`[CAO-S] Wake activo, esperando comando ${WAKE_WINDOW_MS / 1000}s (${deviceId})`);
     return;
   }
+
   // Sin wake previo, ignorar
   if (!armed.has(deviceId)) return;
   clearTimeout(armed.get(deviceId));
@@ -175,13 +213,12 @@ async function runCommand(session, deviceId, raw) {
 // ──────────────────────────────────────────────────────────────
 function attachButton(session, deviceId) {
   const candidates = ["onButtonPress", "onButton", "onHardwareButton", "onTap"];
+  const cb = () => handlePhoto(session, deviceId);
   for (const name of candidates) {
-    if (typeof session.events?.[name] === "function") {
-      try {
-        session.events[name](() => handlePhoto(session, deviceId));
-        console.log(`[CAO-S] Botón físico activo vía ${name}`);
-        return;
-      } catch {}
+    const how = tryAttach(session, name, cb);
+    if (how) {
+      console.log(`[CAO-S] Botón físico activo vía ${how}`);
+      return;
     }
   }
   console.warn("[CAO-S] ⚠️ No encontré evento de botón en el SDK");
