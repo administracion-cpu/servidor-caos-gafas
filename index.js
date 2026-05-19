@@ -1,7 +1,8 @@
 // Servidor puente CAO-S <-> Gafas Mentra
-// - Filtro "oye caos" + comando foto por voz/botón
-// - Reproducción de voz de CAO-S con anti-repetición por marca única
-// - Avisos de mensaje nuevo de CAO-S vía respuesta de latido
+// - El latido NO lleva audio nunca.
+// - Los avisos de "mensaje nuevo de CAO-S" se piden en un canal aparte (fetch_notice).
+// - "Foto añadida al diario" suena UNA sola vez (dedupe por id en gafas).
+// - Botón y voz "oye caos, foto" con anti-rebote (5s).
 import * as MentraSDK from "@mentra/sdk";
 import fetch from "node-fetch";
 
@@ -12,284 +13,212 @@ const ServerBase =
   MentraSDK.default?.TpaServer;
 
 if (!ServerBase) {
-  console.error("[CAO-S] No encuentro servidor Mentra:", Object.keys(MentraSDK));
+  console.error("[CAO-S] No encuentro servidor Mentra en el SDK.");
   process.exit(1);
 }
 
 const {
-  MENTRA_API_KEY,
   MENTRA_PACKAGE_NAME,
-  MENTRA_BRIDGE_SECRET,
-  CAOS_BRIDGE_URL,
+  MENTRA_API_KEY,
+  CAOS_BRIDGE_URL,         // p.ej. https://xnawzzrfbwumhnbmrswk.functions.supabase.co/mentra-bridge
+  CAOS_BRIDGE_SECRET,      // = MENTRA_BRIDGE_SECRET en Supabase
   PORT = 3000,
+  HEARTBEAT_MS = 30000,
+  NOTICE_POLL_MS = 8000,   // sondeo de avisos de voz
+  PHOTO_DEBOUNCE_MS = 5000,
 } = process.env;
 
-if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BRIDGE_URL) {
-  console.error("[CAO-S] Faltan variables de entorno");
+if (!MENTRA_PACKAGE_NAME || !MENTRA_API_KEY || !CAOS_BRIDGE_URL || !CAOS_BRIDGE_SECRET) {
+  console.error("[CAO-S] Faltan variables de entorno obligatorias.");
   process.exit(1);
 }
 
-console.log("[CAO-S] Arrancando. Puente apunta a:", CAOS_BRIDGE_URL);
+// ---------- Estado por gafa ----------
+const lastSpokenId = new Map();   // deviceId -> Set<string> (ids ya reproducidos)
+const lastPhotoAt  = new Map();   // deviceId -> timestamp ms de la última foto procesada
+const timers       = new Map();   // deviceId -> { heartbeat, notice }
 
-process.on("uncaughtException", (err) => {
-  const m = String(err?.message || err);
-  if (m.includes("Unrecognized message type")) {
-    console.warn("[CAO-S] Mensaje desconocido SDK (ignorado):", m);
+function rememberSpoken(deviceId, id) {
+  if (!id) return false;
+  let set = lastSpokenId.get(deviceId);
+  if (!set) { set = new Set(); lastSpokenId.set(deviceId, set); }
+  if (set.has(id)) return false;
+  set.add(id);
+  // pequeño tope para no crecer sin control
+  if (set.size > 200) {
+    const first = set.values().next().value;
+    set.delete(first);
+  }
+  return true;
+}
+
+function canTakePhoto(deviceId) {
+  const now = Date.now();
+  const prev = lastPhotoAt.get(deviceId) || 0;
+  if (now - prev < Number(PHOTO_DEBOUNCE_MS)) return false;
+  lastPhotoAt.set(deviceId, now);
+  return true;
+}
+
+// ---------- Reproducción de voz en gafas ----------
+async function speakOnGlasses(session, deviceId, speak, { allowWithoutId = false } = {}) {
+  if (!speak || !speak.audio_base64) return;
+  if (!speak.id && !allowWithoutId) return;
+  if (speak.id && !rememberSpoken(deviceId, speak.id)) {
+    console.log("[CAO-S] Audio repetido ignorado:", speak.id);
     return;
   }
-  console.error("[CAO-S] uncaughtException:", err);
-});
-process.on("unhandledRejection", (r) => {
-  const m = String(r?.message || r);
-  if (m.includes("Unrecognized message type")) return;
-  console.error("[CAO-S] unhandledRejection:", r);
-});
-
-const HEARTBEAT_MS = 30_000;
-const WAKE_WINDOW_MS = 8000;
-
-const lastSpokenId = new Map();
-
-async function sendToCaos(payload) {
   try {
-    const res = await fetch(CAOS_BRIDGE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-mentra-secret": MENTRA_BRIDGE_SECRET,
-      },
-      body: JSON.stringify(payload),
-    });
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
-    console.log(
-      `[CAO-S] ${res.ok ? "OK" : "FAIL"} ${payload.event_type} →`,
-      JSON.stringify(data).slice(0, 300)
-    );
-    return { ok: res.ok, status: res.status, body: text, data };
+    const buf = Buffer.from(speak.audio_base64, "base64");
+    if (session?.audio?.playAudio) {
+      await session.audio.playAudio({ data: buf, mime: speak.mime || "audio/mpeg" });
+    } else if (session?.playAudio) {
+      await session.playAudio({ data: buf, mime: speak.mime || "audio/mpeg" });
+    } else {
+      console.warn("[CAO-S] No hay API de audio en la sesión.");
+    }
   } catch (e) {
-    console.error("[CAO-S] Error enviando a CAO-S:", e?.message || e);
-    return { ok: false, status: 0, body: "", data: null };
+    console.warn("[CAO-S] Error reproduciendo audio:", e?.message || e);
   }
 }
 
-async function speakOnGlasses(session, deviceId, data, { allowWithoutId = false } = {}) {
-  const speak = data?.speak;
-  const audioB64 = speak?.audio_base64 || data?.audio_base64;
-  if (!audioB64) return;
-
-  const speakId = speak?.id || data?.speak_id || null;
-
-  if (speakId) {
-    if (lastSpokenId.get(deviceId) === speakId) {
-      console.log(`[CAO-S] voz ignorada (id repetido ${speakId})`);
-      return;
-    }
-  } else if (!allowWithoutId) {
-    console.log("[CAO-S] voz sin id → ignorada para evitar eco");
-    return;
+// ---------- Llamada al puente Supabase ----------
+async function callBridge(payload) {
+  const r = await fetch(CAOS_BRIDGE_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-mentra-secret": CAOS_BRIDGE_SECRET,
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`bridge ${r.status}: ${txt}`);
   }
-
-  const audioMime = speak?.mime || speak?.audio_mime || "audio/mpeg";
-  try {
-    const dataUrl = `data:${audioMime};base64,${audioB64}`;
-    if (typeof session.audio?.playAudio === "function") {
-      await session.audio.playAudio({ audioUrl: dataUrl });
-    } else if (typeof session.audio?.play === "function") {
-      await session.audio.play({ audioUrl: dataUrl });
-    } else if (typeof session.layouts?.playAudio === "function") {
-      await session.layouts.playAudio({ audioUrl: dataUrl });
-    } else if (typeof session.speaker?.play === "function") {
-      await session.speaker.play({ audioUrl: dataUrl });
-    } else {
-      console.warn(
-        "[CAO-S] No encuentro API de audio. session keys:",
-        Object.keys(session || {}),
-        "audio keys:",
-        session?.audio ? Object.keys(session.audio) : "(sin audio)"
-      );
-      return;
-    }
-    if (speakId) lastSpokenId.set(deviceId, speakId);
-    console.log(`[CAO-S] 🔊 voz reproducida (id=${speakId || "-"}, ${audioB64.length} b64)`);
-  } catch (e) {
-    console.error("[CAO-S] Error reproduciendo voz:", e?.message || e);
-  }
+  return await r.json();
 }
 
-async function handlePhoto(session, deviceId) {
+// ---------- Foto ----------
+async function handlePhoto(session, deviceId, { caption = "" } = {}) {
+  if (!canTakePhoto(deviceId)) {
+    console.log("[CAO-S] Foto ignorada (rebote anti-doble).");
+    return;
+  }
   try {
-    try { session.layouts?.showTextWall?.("Capturando..."); } catch {}
-
-    let photo;
-    if (typeof session?.camera?.requestPhoto === "function") {
-      photo = await session.camera.requestPhoto();
-    } else if (typeof session?.photos?.requestPhoto === "function") {
-      photo = await session.photos.requestPhoto();
-    } else if (typeof session?.camera?.takePhoto === "function") {
-      photo = await session.camera.takePhoto();
-    } else if (typeof session?.capturePhoto === "function") {
-      photo = await session.capturePhoto();
-    } else if (typeof session?.requestPhoto === "function") {
-      photo = await session.requestPhoto();
-    } else {
-      console.error("[CAO-S] No hay API de foto en esta sesión");
-      try { session.layouts?.showTextWall?.("Cámara no disponible"); } catch {}
+    const photo = await (session.camera?.takePhoto?.() || session.takePhoto?.());
+    if (!photo?.base64) {
+      console.warn("[CAO-S] No se obtuvo foto de la cámara.");
       return;
     }
-
-    const raw =
-      photo?.base64 || photo?.data || photo?.image || photo?.buffer || null;
-    const mime = photo?.mimeType || photo?.mime || "image/jpeg";
-
-    if (!raw) {
-      console.error("[CAO-S] La foto llegó pero sin datos:", photo);
-      try { session.layouts?.showTextWall?.("Foto vacía"); } catch {}
-      return;
-    }
-
-    const base64 =
-      typeof raw === "string" ? raw : Buffer.from(raw).toString("base64");
-
-    const result = await sendToCaos({
+    const payload = {
       device_id: deviceId,
       event_type: "photo",
-      photo_base64: base64,
-      photo_mime: mime,
-      battery_level: session.device?.batteryLevel ?? null,
-      device_model: session.device?.model ?? "Mentra",
+      photo_base64: photo.base64,
+      photo_mime: photo.mime || "image/jpeg",
+      caption,
+      battery_level: session.device?.battery ?? null,
+      device_model: session.device?.model ?? null,
+      gps_lat: session.location?.lat ?? null,
+      gps_lng: session.location?.lng ?? null,
       captured_at: new Date().toISOString(),
-    });
-
-    if (!result.ok) {
-      try { session.layouts?.showTextWall?.(`Error ${result.status || ""}`.trim()); } catch {}
-      return;
-    }
-
-    if (result.body?.includes("glasses_orphan")) {
-      try { session.layouts?.showTextWall?.("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
-    } else if (result.body?.includes("no_target_work")) {
-      try { session.layouts?.showTextWall?.("Sin obra activa en CAO-S."); } catch {}
-    } else {
-      try { session.layouts?.showTextWall?.("Foto enviada al diario ✓"); } catch {}
-    }
-
-    await speakOnGlasses(session, deviceId, result.data, { allowWithoutId: true });
+    };
+    const resp = await callBridge(payload);
+    // La confirmación de foto puede no traer id antiguo; la dejamos pasar siempre,
+    // pero el dedupe por id de speak evita que se repita en ciclos siguientes.
+    await speakOnGlasses(session, deviceId, resp.speak, { allowWithoutId: true });
   } catch (e) {
-    console.error("[CAO-S] Excepción foto:", e?.message || e);
-    try { session.layouts?.showTextWall?.("Error al capturar"); } catch {}
+    console.warn("[CAO-S] Error en foto:", e?.message || e);
   }
 }
 
-function normalize(s) {
-  return (s || "")
-    .toString()
-    .toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/[.,;:!?¿¡"'()\-_/\\]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-const WAKE = /\boye\s+(c|k)aos\b/;
-const PHOTO_CMDS = [
-  /\bfoto\b/,
-  /\bfotografia\b/,
-  /\bhaz(me)?\s+(una\s+)?foto\b/,
-  /\bsaca(me)?\s+(una\s+)?foto\b/,
-  /\btomar?\s+(una\s+)?foto\b/,
-];
-
-function matchCommand(textNorm) {
-  if (!textNorm) return null;
-  if (PHOTO_CMDS.some((rx) => rx.test(textNorm))) return "photo";
-  return "unknown";
-}
-
-const armed = new Map();
-
-async function runCommand(session, deviceId, raw) {
-  const cmd = matchCommand(raw);
-  console.log(`[CAO-S] Comando: "${raw}" → ${cmd}`);
-  if (cmd === "photo") return handlePhoto(session, deviceId);
-  try { session.layouts?.showTextWall?.("Ese comando aún no lo entiendo", { durationMs: 2000 }); } catch {}
-}
-
-function handleHeardText(session, deviceId, rawText) {
-  const text = normalize(rawText);
-  if (!text) return;
-  console.log(`[CAO-S] 🎙️  oído: "${text}"`);
-
-  const hasWake = WAKE.test(text);
-
-  if (hasWake) {
-    const tail = text.replace(WAKE, "").trim();
-    if (tail) { runCommand(session, deviceId, tail); return; }
-    if (armed.has(deviceId)) clearTimeout(armed.get(deviceId));
-    armed.set(deviceId, setTimeout(() => armed.delete(deviceId), WAKE_WINDOW_MS));
-    try { session.layouts?.showTextWall?.("Te escucho…", { durationMs: WAKE_WINDOW_MS }); } catch {}
-    console.log(`[CAO-S] Wake activo ${WAKE_WINDOW_MS / 1000}s (${deviceId})`);
-    return;
-  }
-
-  if (!armed.has(deviceId)) {
-    console.log(`[CAO-S] (ignorado, falta "oye caos"): "${text}"`);
-    return;
-  }
-  clearTimeout(armed.get(deviceId));
-  armed.delete(deviceId);
-  runCommand(session, deviceId, text);
-}
-
-class CaosServer extends ServerBase {
-  async onSession(session, sessionId, userId) {
-    const deviceId = String(userId);
-    try {
-      console.log("[CAO-S] events disponibles:", Object.keys(session.events || {}));
-      console.log("[CAO-S] session keys:", Object.keys(session || {}));
-    } catch (e) { console.log("[CAO-S] no pude listar events:", e?.message); }
-
-    const deviceModel = session.device?.model ?? "Mentra";
-    console.log(`[CAO-S] Sesión abierta device_id=${deviceId} model=${deviceModel}`);
-
-    try { session.layouts.showTextWall("CAO-S conectado. Di \"oye caos, foto\" o pulsa el botón."); } catch {}
-
-    lastSpokenId.delete(deviceId);
-
-    const hb = await sendToCaos({
+// ---------- Latido (sin audio) ----------
+async function sendHeartbeat(session, deviceId) {
+  try {
+    await callBridge({
       device_id: deviceId,
       event_type: "heartbeat",
-      device_model: deviceModel,
-      battery_level: session.device?.batteryLevel ?? null,
+      battery_level: session.device?.battery ?? null,
+      device_model: session.device?.model ?? null,
     });
-    await speakOnGlasses(session, deviceId, hb.data);
+  } catch (e) {
+    console.warn("[CAO-S] Heartbeat error:", e?.message || e);
+  }
+}
 
-    const timer = setInterval(() => {
-      sendToCaos({
-        device_id: deviceId,
-        event_type: "heartbeat",
-        device_model: session.device?.model ?? deviceModel,
-        battery_level: session.device?.batteryLevel ?? null,
-      }).then((r) => speakOnGlasses(session, deviceId, r.data)).catch(() => {});
-    }, HEARTBEAT_MS);
+// ---------- Sondeo de avisos de voz ----------
+async function pollNotice(session, deviceId) {
+  try {
+    const resp = await callBridge({
+      device_id: deviceId,
+      event_type: "fetch_notice",
+      battery_level: session.device?.battery ?? null,
+      device_model: session.device?.model ?? null,
+    });
+    if (resp?.speak) {
+      await speakOnGlasses(session, deviceId, resp.speak);
+    }
+  } catch (e) {
+    console.warn("[CAO-S] Poll aviso error:", e?.message || e);
+  }
+}
 
-    session.events.onDisconnected?.(() => {
-      console.log(`[CAO-S] Sesión cerrada device_id=${deviceId}`);
-      clearInterval(timer);
-      lastSpokenId.delete(deviceId);
+// ---------- Detección de "oye caos, foto" ----------
+function isOyeCaosFoto(text) {
+  if (!text) return false;
+  const t = text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  if (!t.includes("caos") && !t.includes("caso")) return false;
+  return /\bfoto\b|\bfotografia\b|\bhaz una foto\b/.test(t);
+}
+
+// ---------- Servidor ----------
+class CaosServer extends ServerBase {
+  async onSession(session, sessionId, userId) {
+    const deviceId =
+      session.device?.id ||
+      session.glasses?.id ||
+      session.deviceId ||
+      sessionId;
+
+    console.log("[CAO-S] Sesión abierta:", deviceId);
+    lastSpokenId.delete(deviceId);
+    lastPhotoAt.delete(deviceId);
+
+    // Limpieza de temporizadores previos
+    const prev = timers.get(deviceId);
+    if (prev) {
+      clearInterval(prev.heartbeat);
+      clearInterval(prev.notice);
+    }
+    const heartbeat = setInterval(() => sendHeartbeat(session, deviceId), Number(HEARTBEAT_MS));
+    const notice    = setInterval(() => pollNotice(session, deviceId),    Number(NOTICE_POLL_MS));
+    timers.set(deviceId, { heartbeat, notice });
+
+    // Primer latido inmediato
+    sendHeartbeat(session, deviceId).catch(() => {});
+
+    // Botón físico → foto
+    session.events?.onButton?.((e) => {
+      try { handlePhoto(session, deviceId); }
+      catch (err) { console.error("[CAO-S] Botón:", err?.message || err); }
     });
 
-    session.events.onTranscription?.(async (data) => {
+    // Voz: "oye caos, foto"
+    session.events?.onTranscription?.((e) => {
       try {
-        if (!data?.isFinal) return;
-        handleHeardText(session, deviceId, data.text || "");
-      } catch (e) { console.error("[CAO-S] Voz:", e?.message || e); }
+        const txt = e?.text || e?.transcript || "";
+        if (isOyeCaosFoto(txt)) handlePhoto(session, deviceId);
+      } catch (err) { console.error("[CAO-S] Voz:", err?.message || err); }
     });
 
-    session.events.onButtonPress?.(async () => {
-      try { await handlePhoto(session, deviceId); }
-      catch (e) { console.error("[CAO-S] Botón:", e?.message || e); }
+    // Cierre de sesión
+    session.events?.onDisconnect?.(() => {
+      const t = timers.get(deviceId);
+      if (t) { clearInterval(t.heartbeat); clearInterval(t.notice); }
+      timers.delete(deviceId);
+      lastSpokenId.delete(deviceId);
+      lastPhotoAt.delete(deviceId);
+      console.log("[CAO-S] Sesión cerrada:", deviceId);
     });
   }
 }
