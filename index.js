@@ -1,6 +1,7 @@
 // Servidor puente CAO-S <-> Gafas Mentra
-// Base: la versión que oía "foto" perfectamente.
-// Añadido: filtro "oye caos" + reproducción de voz de respuesta de CAO-S.
+// - Filtro "oye caos" + comando foto por voz/botón
+// - Reproducción de voz de CAO-S con anti-repetición por marca única
+// - Avisos de mensaje nuevo de CAO-S vía respuesta de latido
 import * as MentraSDK from "@mentra/sdk";
 import fetch from "node-fetch";
 
@@ -47,9 +48,8 @@ process.on("unhandledRejection", (r) => {
 const HEARTBEAT_MS = 30_000;
 const WAKE_WINDOW_MS = 8000;
 
-// ───────────────────────────────────────────────
-// Envío al puente CAO-S
-// ───────────────────────────────────────────────
+const lastSpokenId = new Map();
+
 async function sendToCaos(payload) {
   try {
     const res = await fetch(CAOS_BRIDGE_URL, {
@@ -65,7 +65,7 @@ async function sendToCaos(payload) {
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
     console.log(
       `[CAO-S] ${res.ok ? "OK" : "FAIL"} ${payload.event_type} →`,
-      JSON.stringify(data)
+      JSON.stringify(data).slice(0, 300)
     );
     return { ok: res.ok, status: res.status, body: text, data };
   } catch (e) {
@@ -74,17 +74,24 @@ async function sendToCaos(payload) {
   }
 }
 
-// ───────────────────────────────────────────────
-// Reproducir voz de CAO-S en las gafas
-// ───────────────────────────────────────────────
-async function speakOnGlasses(session, data) {
+async function speakOnGlasses(session, deviceId, data, { allowWithoutId = false } = {}) {
   const speak = data?.speak;
   const audioB64 = speak?.audio_base64 || data?.audio_base64;
-  const audioMime = speak?.mime || speak?.audio_mime || "audio/mpeg";
-  if (!audioB64) {
-    console.log("[CAO-S] La respuesta no traía audio para hablar");
+  if (!audioB64) return;
+
+  const speakId = speak?.id || data?.speak_id || null;
+
+  if (speakId) {
+    if (lastSpokenId.get(deviceId) === speakId) {
+      console.log(`[CAO-S] voz ignorada (id repetido ${speakId})`);
+      return;
+    }
+  } else if (!allowWithoutId) {
+    console.log("[CAO-S] voz sin id → ignorada para evitar eco");
     return;
   }
+
+  const audioMime = speak?.mime || speak?.audio_mime || "audio/mpeg";
   try {
     const dataUrl = `data:${audioMime};base64,${audioB64}`;
     if (typeof session.audio?.playAudio === "function") {
@@ -104,15 +111,13 @@ async function speakOnGlasses(session, data) {
       );
       return;
     }
-    console.log(`[CAO-S] 🔊 voz reproducida (${audioB64.length} chars b64)`);
+    if (speakId) lastSpokenId.set(deviceId, speakId);
+    console.log(`[CAO-S] 🔊 voz reproducida (id=${speakId || "-"}, ${audioB64.length} b64)`);
   } catch (e) {
     console.error("[CAO-S] Error reproduciendo voz:", e?.message || e);
   }
 }
 
-// ───────────────────────────────────────────────
-// Capturar foto
-// ───────────────────────────────────────────────
 async function handlePhoto(session, deviceId) {
   try {
     try { session.layouts?.showTextWall?.("Capturando..."); } catch {}
@@ -170,16 +175,13 @@ async function handlePhoto(session, deviceId) {
       try { session.layouts?.showTextWall?.("Foto enviada al diario ✓"); } catch {}
     }
 
-    await speakOnGlasses(session, result.data);
+    await speakOnGlasses(session, deviceId, result.data, { allowWithoutId: true });
   } catch (e) {
     console.error("[CAO-S] Excepción foto:", e?.message || e);
     try { session.layouts?.showTextWall?.("Error al capturar"); } catch {}
   }
 }
 
-// ───────────────────────────────────────────────
-// Filtro "oye caos" + ventana de 8 segundos
-// ───────────────────────────────────────────────
 function normalize(s) {
   return (s || "")
     .toString()
@@ -240,21 +242,20 @@ function handleHeardText(session, deviceId, rawText) {
   runCommand(session, deviceId, text);
 }
 
-// ───────────────────────────────────────────────
-// Servidor Mentra
-// ───────────────────────────────────────────────
 class CaosServer extends ServerBase {
   async onSession(session, sessionId, userId) {
     const deviceId = String(userId);
     try {
-  console.log("[CAO-S] events disponibles:", Object.keys(session.events || {}));
-  console.log("[CAO-S] session keys:", Object.keys(session || {}));
-} catch (e) { console.log("[CAO-S] no pude listar events:", e?.message); }
+      console.log("[CAO-S] events disponibles:", Object.keys(session.events || {}));
+      console.log("[CAO-S] session keys:", Object.keys(session || {}));
+    } catch (e) { console.log("[CAO-S] no pude listar events:", e?.message); }
 
     const deviceModel = session.device?.model ?? "Mentra";
     console.log(`[CAO-S] Sesión abierta device_id=${deviceId} model=${deviceModel}`);
 
     try { session.layouts.showTextWall("CAO-S conectado. Di \"oye caos, foto\" o pulsa el botón."); } catch {}
+
+    lastSpokenId.delete(deviceId);
 
     const hb = await sendToCaos({
       device_id: deviceId,
@@ -262,8 +263,7 @@ class CaosServer extends ServerBase {
       device_model: deviceModel,
       battery_level: session.device?.batteryLevel ?? null,
     });
-    // Si el heartbeat trae voz (ej: bienvenida), también la reproducimos
-    await speakOnGlasses(session, hb.data);
+    await speakOnGlasses(session, deviceId, hb.data);
 
     const timer = setInterval(() => {
       sendToCaos({
@@ -271,12 +271,13 @@ class CaosServer extends ServerBase {
         event_type: "heartbeat",
         device_model: session.device?.model ?? deviceModel,
         battery_level: session.device?.batteryLevel ?? null,
-      }).then((r) => speakOnGlasses(session, r.data)).catch(() => {});
+      }).then((r) => speakOnGlasses(session, deviceId, r.data)).catch(() => {});
     }, HEARTBEAT_MS);
 
     session.events.onDisconnected?.(() => {
       console.log(`[CAO-S] Sesión cerrada device_id=${deviceId}`);
       clearInterval(timer);
+      lastSpokenId.delete(deviceId);
     });
 
     session.events.onTranscription?.(async (data) => {
