@@ -1,11 +1,13 @@
 // Servidor puente CAO-S <-> Gafas Mentra
 // - Filtro "oye caos" + comando foto por voz/botón
-// - Latido MUDO (solo presencia + batería, nunca audio)
+// - Latido MUDO (jamás reproduce audio aunque el servidor lo mande)
 // - Canal separado para avisos de voz (mensajes nuevos de CAO-S)
-// - "Foto añadida al diario" solo una vez (anti-repetición por id)
+// - Anti-repetición DOBLE: por id de voz + por hash de contenido (10 min)
+// - Cartel en pantalla con anti-rebote (30 s) para no parpadear el mismo aviso
 // - Anti-rebote: botón/voz no disparan dos fotos seguidas
 import * as MentraSDK from "@mentra/sdk";
 import fetch from "node-fetch";
+import crypto from "node:crypto";
 
 const ServerBase =
   MentraSDK.AppServer ||
@@ -47,16 +49,35 @@ process.on("unhandledRejection", (r) => {
   console.error("[CAO-S] unhandledRejection:", r);
 });
 
-const HEARTBEAT_MS = 30_000;        // latido (mudo) cada 30s
-const NOTICE_POLL_MS = 8_000;        // sondeo de avisos de voz cada 8s
+const HEARTBEAT_MS = 30_000;
+const NOTICE_POLL_MS = 8_000;
 const WAKE_WINDOW_MS = 8_000;
-const PHOTO_DEBOUNCE_MS = 5_000;     // anti-rebote del disparo de foto
+const PHOTO_DEBOUNCE_MS = 5_000;
+const SPEAK_CONTENT_TTL_MS = 10 * 60_000; // mismo audio no se repite en 10 min
+const WALL_CONTENT_TTL_MS = 30_000;       // mismo cartel no se repite en 30 s
 
 // Memoria por gafa
-const lastSpokenId = new Map();      // deviceId -> último speak.id reproducido
-const lastPhotoAt = new Map();       // deviceId -> timestamp última foto
-const photoInFlight = new Map();     // deviceId -> bool
-const sessionTimers = new Map();     // deviceId -> { hb, notice }
+const lastSpokenId = new Map();          // deviceId -> último speak.id reproducido
+const lastSpokenHashAt = new Map();      // deviceId -> { hash, at }  (anti-rep por contenido)
+const lastWallAt = new Map();            // deviceId -> { text, at }  (anti-rep cartel)
+const lastPhotoAt = new Map();
+const photoInFlight = new Map();
+const sessionTimers = new Map();
+
+function sha1Short(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex").slice(0, 16);
+}
+
+function showWallOnce(session, deviceId, text, opts) {
+  if (!text) return;
+  const now = Date.now();
+  const last = lastWallAt.get(deviceId);
+  if (last && last.text === text && now - last.at < WALL_CONTENT_TTL_MS) {
+    return; // mismo cartel hace menos de 30 s → no parpadear
+  }
+  lastWallAt.set(deviceId, { text, at: now });
+  try { session.layouts?.showTextWall?.(text, opts); } catch {}
+}
 
 async function sendToCaos(payload) {
   try {
@@ -82,21 +103,35 @@ async function sendToCaos(payload) {
   }
 }
 
-async function speakOnGlasses(session, deviceId, data) {
+async function speakOnGlasses(session, deviceId, data, { allowHeartbeat = false } = {}) {
   const speak = data?.speak;
   if (!speak) return;
+  // Seguridad extra: nunca hablar como respuesta a un heartbeat.
+  if (!allowHeartbeat && data?.event === "heartbeat") {
+    console.log("[CAO-S] heartbeat con voz → ignorado");
+    return;
+  }
   const audioB64 = speak.audio_base64;
   if (!audioB64) return;
 
   const speakId = speak.id || null;
-
-  // Anti-repetición estricta: sin id no se reproduce
   if (!speakId) {
     console.log("[CAO-S] voz sin id → ignorada");
     return;
   }
+
+  // 1) Bloqueo por id repetido
   if (lastSpokenId.get(deviceId) === speakId) {
     console.log(`[CAO-S] voz ignorada (id repetido ${speakId})`);
+    return;
+  }
+
+  // 2) Bloqueo por contenido: si el mismo audio se reprodujo hace < 10 min
+  //    aunque venga con id distinto, no repetir.
+  const hash = sha1Short(audioB64);
+  const last = lastSpokenHashAt.get(deviceId);
+  if (last && last.hash === hash && Date.now() - last.at < SPEAK_CONTENT_TTL_MS) {
+    console.log(`[CAO-S] voz ignorada (mismo contenido hace ${Date.now() - last.at}ms)`);
     return;
   }
 
@@ -116,6 +151,7 @@ async function speakOnGlasses(session, deviceId, data) {
       return;
     }
     lastSpokenId.set(deviceId, speakId);
+    lastSpokenHashAt.set(deviceId, { hash, at: Date.now() });
     console.log(`[CAO-S] 🔊 voz reproducida id=${speakId}`);
   } catch (e) {
     console.error("[CAO-S] Error reproduciendo voz:", e?.message || e);
@@ -123,7 +159,6 @@ async function speakOnGlasses(session, deviceId, data) {
 }
 
 async function handlePhoto(session, deviceId) {
-  // Anti-rebote: si acabamos de disparar o hay una foto en curso, ignorar
   const now = Date.now();
   const last = lastPhotoAt.get(deviceId) || 0;
   if (photoInFlight.get(deviceId)) {
@@ -138,7 +173,7 @@ async function handlePhoto(session, deviceId) {
   lastPhotoAt.set(deviceId, now);
 
   try {
-    try { session.layouts?.showTextWall?.("Capturando..."); } catch {}
+    showWallOnce(session, deviceId, "Capturando...");
 
     let photo;
     if (typeof session?.camera?.requestPhoto === "function") {
@@ -153,7 +188,7 @@ async function handlePhoto(session, deviceId) {
       photo = await session.requestPhoto();
     } else {
       console.error("[CAO-S] No hay API de foto en esta sesión");
-      try { session.layouts?.showTextWall?.("Cámara no disponible"); } catch {}
+      showWallOnce(session, deviceId, "Cámara no disponible");
       return;
     }
 
@@ -163,7 +198,7 @@ async function handlePhoto(session, deviceId) {
 
     if (!raw) {
       console.error("[CAO-S] La foto llegó pero sin datos:", photo);
-      try { session.layouts?.showTextWall?.("Foto vacía"); } catch {}
+      showWallOnce(session, deviceId, "Foto vacía");
       return;
     }
 
@@ -181,24 +216,25 @@ async function handlePhoto(session, deviceId) {
     });
 
     if (!result.ok) {
-      try { session.layouts?.showTextWall?.(`Error ${result.status || ""}`.trim()); } catch {}
+      showWallOnce(session, deviceId, `Error ${result.status || ""}`.trim());
       return;
     }
 
     if (result.body?.includes("glasses_orphan")) {
-      try { session.layouts?.showTextWall?.("Gafas sin dueño. Reclámalas en CAO-S."); } catch {}
+      showWallOnce(session, deviceId, "Gafas sin dueño. Reclámalas en CAO-S.");
     } else if (result.body?.includes("no_target_work")) {
-      try { session.layouts?.showTextWall?.("Sin obra activa en CAO-S."); } catch {}
+      showWallOnce(session, deviceId, "Sin obra activa en CAO-S.");
+    } else if (result.data?.duplicate) {
+      // Reintento del mismo evento ya guardado: no machacar pantalla ni voz
+      console.log("[CAO-S] foto duplicada según servidor → silencio");
     } else {
-      try { session.layouts?.showTextWall?.("Foto enviada al diario ✓"); } catch {}
+      showWallOnce(session, deviceId, "Foto enviada al diario ✓");
     }
 
-    // La confirmación "Foto añadida al diario..." viene con id único.
-    // Si por cualquier rebote llega dos veces, speakOnGlasses la ignora.
     await speakOnGlasses(session, deviceId, result.data);
   } catch (e) {
     console.error("[CAO-S] Excepción foto:", e?.message || e);
-    try { session.layouts?.showTextWall?.("Error al capturar"); } catch {}
+    showWallOnce(session, deviceId, "Error al capturar");
   } finally {
     photoInFlight.set(deviceId, false);
   }
@@ -235,7 +271,7 @@ async function runCommand(session, deviceId, raw) {
   const cmd = matchCommand(raw);
   console.log(`[CAO-S] Comando: "${raw}" → ${cmd}`);
   if (cmd === "photo") return handlePhoto(session, deviceId);
-  try { session.layouts?.showTextWall?.("Ese comando aún no lo entiendo", { durationMs: 2000 }); } catch {}
+  showWallOnce(session, deviceId, "Ese comando aún no lo entiendo", { durationMs: 2000 });
 }
 
 function handleHeardText(session, deviceId, rawText) {
@@ -250,7 +286,7 @@ function handleHeardText(session, deviceId, rawText) {
     if (tail) { runCommand(session, deviceId, tail); return; }
     if (armed.has(deviceId)) clearTimeout(armed.get(deviceId));
     armed.set(deviceId, setTimeout(() => armed.delete(deviceId), WAKE_WINDOW_MS));
-    try { session.layouts?.showTextWall?.("Te escucho…", { durationMs: WAKE_WINDOW_MS }); } catch {}
+    showWallOnce(session, deviceId, "Te escucho…", { durationMs: WAKE_WINDOW_MS });
     console.log(`[CAO-S] Wake activo ${WAKE_WINDOW_MS / 1000}s (${deviceId})`);
     return;
   }
@@ -264,7 +300,6 @@ function handleHeardText(session, deviceId, rawText) {
   runCommand(session, deviceId, text);
 }
 
-// Pide al puente UN aviso de voz pendiente (mensajes nuevos de CAO-S)
 async function pollVoiceNotice(session, deviceId, deviceModel) {
   const r = await sendToCaos({
     device_id: deviceId,
@@ -286,14 +321,15 @@ class CaosServer extends ServerBase {
     const deviceModel = session.device?.model ?? "Mentra";
     console.log(`[CAO-S] Sesión abierta device_id=${deviceId} model=${deviceModel}`);
 
-    try { session.layouts.showTextWall("CAO-S conectado. Di \"oye caos, foto\" o pulsa el botón."); } catch {}
+    showWallOnce(session, deviceId, "CAO-S conectado. Di \"oye caos, foto\" o pulsa el botón.");
 
-    // Reset de memoria por gafa
     lastSpokenId.delete(deviceId);
+    lastSpokenHashAt.delete(deviceId);
+    lastWallAt.delete(deviceId);
     lastPhotoAt.delete(deviceId);
     photoInFlight.set(deviceId, false);
 
-    // Latido inicial (MUDO: no reproduce audio aunque venga)
+    // Latido inicial: MUDO. No pasamos por speakOnGlasses.
     await sendToCaos({
       device_id: deviceId,
       event_type: "heartbeat",
@@ -301,7 +337,6 @@ class CaosServer extends ServerBase {
       battery_level: session.device?.batteryLevel ?? null,
     });
 
-    // Loop 1: latido cada 30s (mudo, solo presencia/batería)
     const hbTimer = setInterval(() => {
       sendToCaos({
         device_id: deviceId,
@@ -311,7 +346,6 @@ class CaosServer extends ServerBase {
       }).catch(() => {});
     }, HEARTBEAT_MS);
 
-    // Loop 2: avisos de voz cada 8s (canal separado del latido)
     const noticeTimer = setInterval(() => {
       pollVoiceNotice(session, deviceId, deviceModel).catch(() => {});
     }, NOTICE_POLL_MS);
@@ -324,6 +358,8 @@ class CaosServer extends ServerBase {
       if (t) { clearInterval(t.hb); clearInterval(t.notice); }
       sessionTimers.delete(deviceId);
       lastSpokenId.delete(deviceId);
+      lastSpokenHashAt.delete(deviceId);
+      lastWallAt.delete(deviceId);
       lastPhotoAt.delete(deviceId);
       photoInFlight.delete(deviceId);
     });
