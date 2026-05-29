@@ -6,19 +6,13 @@
 // Variables de entorno necesarias en Render:
 //   MENTRA_PACKAGE_NAME   -> tu package name de Mentra
 //   MENTRA_API_KEY        -> tu API key de Mentra
-//   CAOS_WEBHOOK_URL      -> https://xnawzzrfbwumhnbmrswk.supabase.co/functions/v1/mentra-bridge
 //   MENTRA_BRIDGE_SECRET  -> mismo secreto que ya tienes en Supabase
+//   Y la URL del webhook, con CUALQUIERA de estos nombres (vale el primero
+//   que esté puesto):
+//     CAOS_WEBHOOK_URL
+//     CAOS_BRIDGE_URL
+//     URL_DE_WEB_DE_CAOS
 //   PORT                  -> lo pone Render solo, no tocar
-//
-// Qué hace:
-//   - Saluda al conectar las gafas.
-//   - Voz/Botón: una foto -> webhook (con anti-rebote de 5s).
-//   - Cada 4 segundos pregunta al webhook si hay órdenes pendientes
-//     (fetch_command). Si llega "start_livestream", enciende la emisión
-//     WebRTC de Mentra y reporta la URL al webhook (livestream_started).
-//     Si llega "stop_livestream", la apaga y reporta (livestream_stopped).
-//   - Cada 8 segundos pregunta avisos de voz pendientes (fetch_notice) y los
-//     reproduce en las gafas.
 // -----------------------------------------------------------------------------
 
 import * as MentraSDK from "@mentra/sdk";
@@ -37,25 +31,36 @@ if (!ServerBase) {
 const {
   MENTRA_PACKAGE_NAME,
   MENTRA_API_KEY,
-  CAOS_WEBHOOK_URL,
   MENTRA_BRIDGE_SECRET,
   PORT = "3000",
 } = process.env;
 
+// Acepta el nombre nuevo y los viejos. Coge el primero que tenga valor.
+const CAOS_WEBHOOK_URL =
+  process.env.CAOS_WEBHOOK_URL ||
+  process.env.CAOS_BRIDGE_URL ||
+  process.env.URL_DE_WEB_DE_CAOS;
+
 if (!MENTRA_PACKAGE_NAME || !MENTRA_API_KEY) {
   throw new Error("[CAO-S] Faltan MENTRA_PACKAGE_NAME o MENTRA_API_KEY");
 }
-if (!CAOS_WEBHOOK_URL || !MENTRA_BRIDGE_SECRET) {
-  throw new Error("[CAO-S] Faltan CAOS_WEBHOOK_URL o MENTRA_BRIDGE_SECRET");
+if (!CAOS_WEBHOOK_URL) {
+  throw new Error(
+    "[CAO-S] Falta la URL del webhook. Pon una de estas variables en Render: " +
+    "CAOS_WEBHOOK_URL, CAOS_BRIDGE_URL o URL_DE_WEB_DE_CAOS"
+  );
+}
+if (!MENTRA_BRIDGE_SECRET) {
+  throw new Error("[CAO-S] Falta MENTRA_BRIDGE_SECRET");
 }
 
 // Estado en memoria por gafa --------------------------------------------------
-const lastPhotoAt = new Map();         // deviceId -> ms
-const failWallUntil = new Map();       // deviceId -> ms
-const liveSessions = new Map();        // deviceId -> session
-const liveStreamActive = new Map();    // deviceId -> bool
-const commandPollers = new Map();      // deviceId -> intervalId
-const noticePollers = new Map();       // deviceId -> intervalId
+const lastPhotoAt = new Map();
+const failWallUntil = new Map();
+const liveSessions = new Map();
+const liveStreamActive = new Map();
+const commandPollers = new Map();
+const noticePollers = new Map();
 
 const PHOTO_DEBOUNCE_MS = 5_000;
 const FAIL_WALL_MS = 30_000;
@@ -177,7 +182,7 @@ async function stopLivestream(session, deviceId) {
   await postToCaos({ device_id: deviceId, event_type: "livestream_stopped" });
 }
 
-// Sondeo de órdenes (start/stop livestream) ----------------------------------
+// Sondeo de órdenes ----------------------------------------------------------
 function startCommandPoller(session, deviceId) {
   stopCommandPoller(deviceId);
   const id = setInterval(async () => {
@@ -219,10 +224,8 @@ class CaosServer extends ServerBase {
     const deviceId = userId || sessionId;
     liveSessions.set(deviceId, session);
 
-    // Saludo único al conectar
     await speakOnGlasses(session, { text: "CAO-S listo" });
 
-    // Voz: cualquier transcripción dispara foto
     if (session.events?.onTranscription) {
       session.events.onTranscription(async () => {
         try { await handlePhoto(session, deviceId); }
@@ -230,7 +233,6 @@ class CaosServer extends ServerBase {
       });
     }
 
-    // Botón físico: foto
     if (session.events?.onButtonPress) {
       session.events.onButtonPress(async () => {
         try { await handlePhoto(session, deviceId); }
@@ -238,14 +240,11 @@ class CaosServer extends ServerBase {
       });
     }
 
-    // Arrancar sondeos
     startCommandPoller(session, deviceId);
     startNoticePoller(session, deviceId);
 
-    // Latido inicial (presencia)
     await postToCaos({ device_id: deviceId, event_type: "heartbeat" });
 
-    // Limpieza al desconectar
     if (session.events?.onDisconnected) {
       session.events.onDisconnected(async () => {
         stopCommandPoller(deviceId);
