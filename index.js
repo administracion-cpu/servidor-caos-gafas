@@ -3,8 +3,10 @@
 // - Solo un saludo al conectar.
 // - Voz/Botón: una foto. Si falla → cartel y se anula. No reintenta.
 // - Anti-rebote foto 5 s. Anti-parpadeo cartel 30 s.
+// - NUEVO Fase 2: canal de control para arrancar/parar livestream WebRTC.
 import * as MentraSDK from "@mentra/sdk";
 import fetch from "node-fetch";
+import http from "node:http";
 
 const ServerBase =
   MentraSDK.AppServer ||
@@ -23,6 +25,7 @@ const {
   MENTRA_BRIDGE_SECRET,
   CAOS_BRIDGE_URL,
   PORT = 3000,
+  CONTROL_PORT = 3001, // NUEVO: puerto del canal de control para CAO-S
 } = process.env;
 
 if (!MENTRA_API_KEY || !MENTRA_PACKAGE_NAME || !MENTRA_BRIDGE_SECRET || !CAOS_BRIDGE_URL) {
@@ -52,6 +55,10 @@ const lastSpokenId = new Map();
 const lastWallAt = new Map();
 const lastPhotoAt = new Map();
 const photoInFlight = new Map();
+
+// NUEVO: sesiones vivas indexadas por deviceId, y estado de livestream
+const liveSessions = new Map();        // deviceId -> session
+const liveStreamActive = new Map();    // deviceId -> boolean
 
 function showWallOnce(session, deviceId, text, opts) {
   if (!text) return;
@@ -175,6 +182,118 @@ async function handlePhoto(session, deviceId) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// NUEVO Fase 2: livestream WebRTC bajo demanda
+// ─────────────────────────────────────────────────────────────
+async function startLivestream(session, deviceId) {
+  try {
+    let info;
+    if (typeof session?.camera?.startStream === "function") {
+      info = await session.camera.startStream({ streamType: "managed" });
+    } else if (typeof session?.camera?.startManagedStream === "function") {
+      info = await session.camera.startManagedStream();
+    } else if (typeof session?.streaming?.start === "function") {
+      info = await session.streaming.start({ streamType: "managed" });
+    } else {
+      return { ok: false, error: "streaming_not_supported" };
+    }
+
+    liveStreamActive.set(deviceId, true);
+
+    // La URL útil para WebRTC (WHEP) suele venir en uno de estos campos
+    const whepUrl =
+      info?.whepUrl || info?.webrtcUrl || info?.url || info?.streamUrl || null;
+    const hlsUrl = info?.hlsUrl || null;
+    const dashUrl = info?.dashUrl || null;
+    const streamId = info?.streamId || info?.id || null;
+
+    console.log(`[CAO-S] Livestream ON device=${deviceId} whep=${whepUrl ? "sí" : "no"}`);
+    return { ok: true, whepUrl, hlsUrl, dashUrl, streamId, raw: info ?? null };
+  } catch (e) {
+    console.error("[CAO-S] startLivestream error:", e?.message || e);
+    liveStreamActive.set(deviceId, false);
+    return { ok: false, error: String(e?.message || e) };
+  }
+}
+
+async function stopLivestream(session, deviceId) {
+  // Siempre intentamos parar, aunque ya estuviera parado.
+  try {
+    if (typeof session?.camera?.stopStream === "function") {
+      await session.camera.stopStream();
+    } else if (typeof session?.camera?.stopManagedStream === "function") {
+      await session.camera.stopManagedStream();
+    } else if (typeof session?.streaming?.stop === "function") {
+      await session.streaming.stop();
+    }
+  } catch (e) {
+    console.error("[CAO-S] stopLivestream error:", e?.message || e);
+  } finally {
+    liveStreamActive.set(deviceId, false);
+    console.log(`[CAO-S] Livestream OFF device=${deviceId}`);
+  }
+  return { ok: true };
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (c) => { body += c; if (body.length > 1_000_000) req.destroy(); });
+    req.on("end", () => {
+      if (!body) return resolve({});
+      try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+    });
+    req.on("error", reject);
+  });
+}
+
+const controlServer = http.createServer(async (req, res) => {
+  // Auth simple con el mismo secreto compartido
+  const secret = req.headers["x-mentra-secret"];
+  if (secret !== MENTRA_BRIDGE_SECRET) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
+  }
+  if (req.method !== "POST") {
+    res.writeHead(405, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "method_not_allowed" }));
+  }
+
+  let payload;
+  try { payload = await readJsonBody(req); }
+  catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "bad_json" }));
+  }
+
+  const deviceId = String(payload?.device_id || "");
+  const session = liveSessions.get(deviceId);
+  if (!deviceId || !session) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "glasses_not_connected" }));
+  }
+
+  let result;
+  if (req.url === "/livestream/start") {
+    result = await startLivestream(session, deviceId);
+  } else if (req.url === "/livestream/stop") {
+    result = await stopLivestream(session, deviceId);
+  } else {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ ok: false, error: "unknown_route" }));
+  }
+
+  res.writeHead(result.ok ? 200 : 500, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(result));
+});
+
+controlServer.listen(Number(CONTROL_PORT), () => {
+  console.log(`[CAO-S] Canal de control escuchando puerto ${CONTROL_PORT}`);
+});
+
+// ─────────────────────────────────────────────────────────────
+// Voz y comandos
+// ─────────────────────────────────────────────────────────────
 function normalize(s) {
   return (s || "").toString().toLowerCase()
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -227,7 +346,11 @@ class CaosServer extends ServerBase {
     const deviceModel = session.device?.model ?? "Mentra";
     console.log(`[CAO-S] Sesión abierta device_id=${deviceId}`);
 
-    showWallOnce(session, deviceId, "CAO-S conectado. Di \"oye caos, foto\" o pulsa el botón.");
+    // NUEVO: guardamos la sesión viva para el canal de control
+    liveSessions.set(deviceId, session);
+    liveStreamActive.set(deviceId, false);
+
+    showWallOnce(session, deviceId, "CAO-S conectado.");
 
     lastSpokenId.delete(deviceId);
     lastWallAt.delete(deviceId);
@@ -242,12 +365,18 @@ class CaosServer extends ServerBase {
       battery_level: session.device?.batteryLevel ?? null,
     });
 
-    session.events.onDisconnected?.(() => {
+    session.events.onDisconnected?.(async () => {
       console.log(`[CAO-S] Sesión cerrada device_id=${deviceId}`);
+      // Si quedó un stream colgado, lo paramos siempre.
+      if (liveStreamActive.get(deviceId)) {
+        try { await stopLivestream(session, deviceId); } catch {}
+      }
       lastSpokenId.delete(deviceId);
       lastWallAt.delete(deviceId);
       lastPhotoAt.delete(deviceId);
       photoInFlight.delete(deviceId);
+      liveSessions.delete(deviceId);
+      liveStreamActive.delete(deviceId);
     });
 
     session.events.onTranscription?.(async (data) => {
