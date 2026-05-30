@@ -1,5 +1,6 @@
 // Servidor puente CAO-S <-> Gafas Mentra
-// Foto por voz ("oye caos, foto") + botón + videollamada gestionada WebRTC.
+// Foto por voz ("oye caos, foto") + botón + videollamada WebRTC directa
+// (mismo modo "Stream Here" que usa la app oficial de Mentra).
 // Nunca toca RTMP.
 
 import * as MentraSDK from "@mentra/sdk";
@@ -55,7 +56,15 @@ const WALL_CONTENT_TTL_MS = 30_000;
 const FAIL_WALL_MS = 4_000;
 const COMMAND_POLL_MS = 4_000;
 const NOTICE_POLL_MS = 8_000;
-const LIVESTREAM_WAIT_MS = 20_000; // antes 12s; las gafas a veces tardan más
+const LIVESTREAM_WAIT_MS = 35_000; // damos más margen
+const LIVESTREAM_RETRY_AFTER_MS = 12_000; // si en 12s no hay url, reintento una vez
+
+// Mismos ajustes que la app oficial "Stream Here" (lo que conecta en 5s)
+const STREAM_OPTIONS = {
+  quality: "720p",
+  video: { width: 720, height: 480, bitrate: 1_000_000, frameRate: 30 },
+  audio: true,
+};
 
 // ---------------------------------------------------------------------------
 // Estado por gafa
@@ -112,7 +121,7 @@ async function sendToCaos(payload) {
 }
 
 // ---------------------------------------------------------------------------
-// Voz en gafas
+// Voz en gafas (igual)
 // ---------------------------------------------------------------------------
 async function speakOnGlasses(session, deviceId, speak) {
   if (!speak) return;
@@ -147,7 +156,7 @@ async function speakOnGlasses(session, deviceId, speak) {
 }
 
 // ---------------------------------------------------------------------------
-// Foto (igual que antes — funciona)
+// Foto (igual — funciona)
 // ---------------------------------------------------------------------------
 async function handlePhoto(session, deviceId) {
   const now = Date.now();
@@ -252,91 +261,115 @@ function handleHeardText(session, deviceId, rawText) {
 }
 
 // ---------------------------------------------------------------------------
-// Livestream — SOLO WebRTC gestionado. NUNCA RTMP.
+// Livestream — WebRTC directo estilo "Stream Here". Nunca RTMP.
 // ---------------------------------------------------------------------------
 function extractStreamUrl(obj) {
   if (!obj || typeof obj !== "object") return null;
-  return obj.webrtcUrl || obj.webrtc_url || obj.whepUrl || obj.whep_url ||
-         obj.url || obj.streamUrl || obj.stream_url || obj.hlsUrl || obj.playbackUrl || null;
+  // Cubrimos todas las formas que mete Mentra: webrtc, whep, share, viewer…
+  return (
+    obj.webrtcUrl || obj.webrtc_url ||
+    obj.whepUrl || obj.whep_url ||
+    obj.viewerUrl || obj.viewer_url ||
+    obj.shareUrl || obj.share_url ||
+    obj.playbackUrl || obj.playback_url ||
+    obj.hlsUrl || obj.hls_url ||
+    obj.streamUrl || obj.stream_url ||
+    obj.url || null
+  );
 }
 
-// Solo métodos que son managed/WebRTC explícitamente. NO usamos startStream
-// ni startLivestream genéricos porque el SDK los enruta a RTMP por defecto
-// (y eso es lo que produce el "RTMP stream request starting" en el log).
-async function tryStartManaged(cam) {
-  if (typeof cam.startManagedStream === "function") {
-    try { return (await cam.startManagedStream()) ?? {}; }
-    catch (e) { console.warn("[CAO-S] startManagedStream:", e?.message || e); }
-  }
-  if (typeof cam.requestManagedStream === "function") {
-    try { return (await cam.requestManagedStream()) ?? {}; }
-    catch (e) { console.warn("[CAO-S] requestManagedStream:", e?.message || e); }
-  }
-  // Como último recurso: startStream({ streamType:'managed' }) PERO solo si
-  // existe el evento onLivestreamStatus (señal de que el SDK soporta managed).
-  if (typeof cam.startStream === "function" && typeof cam.onLivestreamStatus === "function") {
-    try { return (await cam.startStream({ streamType: "managed" })) ?? {}; }
-    catch (e) {
+// Probamos en orden los métodos que la app oficial "Stream Here" usa.
+// startStream({ streamType:'webrtc', ...quality }) es el equivalente directo.
+async function tryStartWebRTC(cam) {
+  const attempts = [
+    () => cam.startManagedStream?.(STREAM_OPTIONS),
+    () => cam.startManagedStream?.(),
+    () => cam.requestManagedStream?.(STREAM_OPTIONS),
+    () => cam.requestManagedStream?.(),
+    () => cam.startStream?.({ streamType: "webrtc", ...STREAM_OPTIONS }),
+    () => cam.startStream?.({ streamType: "managed", ...STREAM_OPTIONS }),
+    () => cam.startWebRTCStream?.(STREAM_OPTIONS),
+    () => cam.startWebRTC?.(STREAM_OPTIONS),
+  ];
+  for (const run of attempts) {
+    try {
+      const fn = run();
+      if (fn === undefined) continue; // método no existe en este SDK
+      const res = (await fn) ?? {};
+      // Si devuelve URL directa, perfecto: lo usamos al instante
+      const urlNow = extractStreamUrl(res) || extractStreamUrl(res?.stream);
+      return { res, urlNow };
+    } catch (e) {
       const msg = String(e?.message || e);
       if (msg.includes("rtmpUrl is required")) {
-        console.warn("[CAO-S] startStream cayó en rama RTMP — descartado");
-        return null;
+        console.warn("[CAO-S] el SDK quiso RTMP — descartado, sigo con el siguiente método");
+        continue;
       }
-      console.warn("[CAO-S] startStream(managed):", msg);
+      console.warn("[CAO-S] intento de stream falló:", msg);
     }
   }
   return null;
 }
 
-async function startLivestream(session, deviceId, callSessionId) {
-  const cam = session?.camera;
-  if (!cam) { console.warn("[CAO-S] camera no disponible"); return false; }
-  console.log(`[CAO-S] start_livestream (managed/webrtc) device=${deviceId} call=${callSessionId || "-"}`);
-
-  showWallOnce(session, deviceId, "Conectando vídeo…", { durationMs: LIVESTREAM_WAIT_MS });
-
+async function attemptStartOnce(session, deviceId, cam, waitMs) {
   let urlFromEvent = null;
   let offEvent = null;
-  const urlPromise = new Promise((resolve) => {
+  const eventPromise = new Promise((resolve) => {
     try {
       if (typeof cam.onLivestreamStatus === "function") {
         offEvent = cam.onLivestreamStatus((st) => {
           try {
             const status = st?.status || st?.state;
             const u = extractStreamUrl(st) || extractStreamUrl(st?.stream);
-            if (status === "active" && u) { urlFromEvent = u; resolve(u); }
+            if ((status === "active" || status === "live" || status === "ready") && u) {
+              urlFromEvent = u; resolve(u);
+            }
             if (status === "error" || status === "failed") resolve(null);
           } catch {}
         });
       }
     } catch {}
-    setTimeout(() => resolve(urlFromEvent), LIVESTREAM_WAIT_MS);
+    setTimeout(() => resolve(urlFromEvent), waitMs);
   });
 
-  const startRes = await tryStartManaged(cam);
-  if (startRes === null) {
-    console.warn("[CAO-S] No hay método managed disponible (o cayó en RTMP)");
+  const started = await tryStartWebRTC(cam);
+  if (!started) {
     try { offEvent?.(); } catch {}
-    showFailWall(session, "Vídeo no soportado en estas gafas.");
-    await sendToCaos({
-      device_id: deviceId, event_type: "livestream_failed",
-      reason: "no_managed_api", call_session_id: callSessionId || null,
-    });
-    return false;
+    return { ok: false, reason: "no_webrtc_api" };
+  }
+  if (started.urlNow) {
+    try { offEvent?.(); } catch {}
+    return { ok: true, url: started.urlNow };
+  }
+  const url = await eventPromise;
+  try { offEvent?.(); } catch {}
+  if (url) return { ok: true, url };
+  return { ok: false, reason: "no_url" };
+}
+
+async function startLivestream(session, deviceId, callSessionId) {
+  const cam = session?.camera;
+  if (!cam) { console.warn("[CAO-S] camera no disponible"); return false; }
+  console.log(`[CAO-S] start_livestream (webrtc directo) device=${deviceId} call=${callSessionId || "-"}`);
+
+  showWallOnce(session, deviceId, "Conectando vídeo…", { durationMs: LIVESTREAM_WAIT_MS });
+
+  // 1er intento corto. Si las gafas tardan en arrancar cámara, reintento 1 vez.
+  let result = await attemptStartOnce(session, deviceId, cam, LIVESTREAM_RETRY_AFTER_MS);
+  if (!result.ok && result.reason === "no_url") {
+    console.warn("[CAO-S] sin URL al primer intento, reintento limpio");
+    try { await stopLivestreamSilent(session); } catch {}
+    await new Promise((r) => setTimeout(r, 1500));
+    result = await attemptStartOnce(session, deviceId, cam, LIVESTREAM_WAIT_MS - LIVESTREAM_RETRY_AFTER_MS);
   }
 
-  let streamUrl = extractStreamUrl(startRes) || extractStreamUrl(startRes?.stream);
-  const fromEvent = await urlPromise;
-  if (fromEvent) streamUrl = fromEvent;
-  try { offEvent?.(); } catch {}
-
-  if (!streamUrl) {
-    console.warn("[CAO-S] livestream sin URL tras esperar 'active'. Aborto.");
+  if (!result.ok) {
+    console.warn(`[CAO-S] livestream fallo: ${result.reason}`);
     try { await stopLivestreamSilent(session); } catch {}
     showFailWall(session, "Sin vídeo. Reintenta.");
     await sendToCaos({
       device_id: deviceId, event_type: "livestream_failed",
-      reason: "no_url", call_session_id: callSessionId || null,
+      reason: result.reason, call_session_id: callSessionId || null,
     });
     return false;
   }
@@ -346,7 +379,7 @@ async function startLivestream(session, deviceId, callSessionId) {
 
   await sendToCaos({
     device_id: deviceId, event_type: "livestream_started",
-    stream_url: streamUrl, stream_kind: "webrtc",
+    stream_url: result.url, stream_kind: "webrtc",
     call_session_id: callSessionId || null,
   });
   return true;
@@ -355,6 +388,7 @@ async function startLivestream(session, deviceId, callSessionId) {
 async function stopLivestreamSilent(session) {
   try {
     if (session?.camera?.stopManagedStream) await session.camera.stopManagedStream();
+    else if (session?.camera?.stopWebRTCStream) await session.camera.stopWebRTCStream();
     else if (session?.camera?.stopStream) await session.camera.stopStream();
     else if (session?.camera?.stopLivestream) await session.camera.stopLivestream();
     else if (session?.streaming?.stop) await session.streaming.stop();
